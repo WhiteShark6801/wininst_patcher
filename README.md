@@ -29,7 +29,7 @@ Enjoy.
 
 *Q1) Does it support every build + language combinations?*
 
-**A1) Mostly. Japanese and Korean builds break during GUI-mode Setup due to Certificate Checks. There must be a way to fix it. It'll stay unsupported for now.**
+**A1) Mostly. Japanese and Korean builds break during GUI-mode Setup due to signature checks failing on those languages. There must be a way to fix it. It'll stay unsupported for now.**
 
 *Q2) Chinese characters are corrupted during text-mode Setup. Why?*
 
