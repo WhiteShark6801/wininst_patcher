@@ -27,34 +27,34 @@ Enjoy.
 
 # FAQ
 
-Q1) Does it support every build + language combinations? 
+*Q1) Does it support every build + language combinations?*
 
-A1) Mostly. Japanese and Korean builds don't work on Setup. There must be a way to fix it. It'll stay unsupported for now.
+**A1) Mostly. Japanese and Korean builds don't work on Setup. There must be a way to fix it. It'll stay unsupported for now.**
 
-Q2) Chinese characters are corrupted during text-mode Setup. Why?
+*Q2) Chinese characters are corrupted during text-mode Setup. Why?*
 
-A2) You have to copy the file spddlang.sys from your donor ISO. Make sure to match architectures (absolutely) and build numbers (if possible, otherwise use the file from closest available Chinese ISO)
+**A2) You have to copy the file spddlang.sys from your donor ISO. Make sure to match architectures (absolutely) and build numbers (if possible, otherwise use the file from closest available Chinese ISO)**
 
-Q3) Why does it generate half-translated ISOs? 
+*Q3) Why does it generate half-translated ISOs?*
 
-A3) Some files fail to have resources replaced. These are errors which I can't fix for now. But will check through Resource Hacker.
+**A3) Some files fail to have resources replaced. These are errors which I can't fix for now. But will check through Resource Hacker.**
 
-Q4) Can I use this tool to translate Longhorn ISOs?
+*Q4) Can I use this tool to translate Longhorn ISOs?*
 
-A4) Theoritically you can unless it uses the .WIM format. However it is untested.
+**A4) Theoritically you can unless it uses the .WIM format. However it is untested.**
 
-Q5) Can I use this tool to translate Windows 2000 ISOs?
+*Q5) Can I use this tool to translate Windows 2000 ISOs?*
 
-A5) Yes, but the support is limited.
+**A5) Yes, but the support is limited for Windows 2000.**
 
-Q6) What is the recommended setup for Windows XP Professional x64 Edition?
+*Q6) What is the recommended setup for Windows XP Professional x64 Edition?*
 
-A6)
+A6) This should be the preferrable format.
 
-Base = English Windows XP Professional x64 Edition
+**Base = English Windows XP Professional x64 Edition**
 
-Donor = <any language Windows Server 2003 x86> + <any language Windows XP SP2 binaries without overwritten>
+**Donor = any language Windows Server 2003 x86 + any language Windows XP SP2 binaries without overwritten**
 
-A7) My question is not answered here.
+*A7) My question is not answered here.*
 
-Q7) You can create a new pull request to ask.
+**Q7) You can create a new pull request to ask.**
