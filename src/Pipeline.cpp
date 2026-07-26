@@ -8,6 +8,12 @@
 #include <imagehlp.h>
 #include <utility>
 #pragma comment(lib, "imagehlp.lib")
+#include <algorithm>
+#include <cwctype>
+#include <set>
+#include <fstream>
+#include <string>
+#include <vector>
 
 // (dir, oldName, newName) - records every rename so we can undo it later.
 struct WRename {
@@ -421,7 +427,8 @@ enum class TargetOs {
     Win2000,
     WinXP,
     Win2003,
-    Win2003x64
+    Win2003x64,
+	Win2003IA64 // Added for Itanium support
 };
 
 struct HexEditDef {
@@ -438,7 +445,9 @@ static TargetOs DetectBaseOs(const std::wstring& iso1Root) {
     if (DirExists(PathJoin(iso1Root, L"AMD64"))) {
         return TargetOs::Win2003x64;
     }
-
+	if (DirExists(PathJoin(iso1Root, L"IA64"))) {
+        return TargetOs::Win2003IA64;
+    }
     // Determine the main subfolder on the Base ISO (usually I386)
     std::wstring distributionDir = PathJoin(iso1Root, L"I386");
     if (!DirExists(distributionDir)) {
@@ -469,6 +478,98 @@ static TargetOs DetectBaseOs(const std::wstring& iso1Root) {
     return TargetOs::Win2000;
 }
 
+// Formats a string to uppercase for robust section matching
+static std::wstring ToUpper(std::wstring str) {
+    std::transform(str.begin(), str.end(), str.begin(), ::towupper);
+    return str;
+}
+
+// Trims whitespace from both ends of a line
+static std::wstring Trim(const std::wstring& str) {
+    size_t first = str.find_first_not_of(L" \t\r\n");
+    if (first == std::wstring::npos) return L"";
+    size_t last = str.find_last_not_of(L" \t\r\n");
+    return str.substr(first, (last - first + 1));
+}
+
+void AddFontToSourceDisksFiles(const std::wstring& txtsetupPath, const std::wstring& vgaFontName) {
+    if (vgaFontName.empty()) {
+        LogWarn(L"Skipping txtsetup.sif font injection: Font filename is empty.");
+        return;
+    }
+
+    std::wifstream inFile(txtsetupPath);
+    if (!inFile.is_open()) {
+        LogError(L"Failed to open txtsetup.sif for reading: %s", txtsetupPath.c_str());
+        return;
+    }
+
+    std::vector<std::wstring> lines;
+    std::wstring line;
+    while (std::getline(inFile, line)) {
+        lines.push_back(line);
+    }
+    inFile.close();
+
+    bool sectionFound = false;
+    size_t targetIndex = 0;
+    bool alreadyExists = false;
+    
+    std::wstring newLine = vgaFontName + L"   = 1,,,,,,3_,22,0,0,,1,2";
+    std::wstring formattedFontUpper = ToUpper(vgaFontName);
+
+    for (size_t i = 0; i < lines.size(); ++i) {
+        std::wstring trimmed = Trim(lines[i]);
+        std::wstring upperLine = ToUpper(trimmed);
+
+        // Robust section matching: checks if the string starts with '[SOURCEDISKSFILES]'
+        if (upperLine.rfind(L"[SOURCEDISKSFILES]", 0) == 0) {
+            sectionFound = true;
+            targetIndex = i + 1;
+            continue;
+        }
+
+        if (sectionFound) {
+            // Next section boundaries
+            if (!upperLine.empty() && upperLine[0] == L'[') {
+                targetIndex = i;
+                break;
+            }
+
+            // Deduplication matching
+            if (upperLine.rfind(formattedFontUpper, 0) == 0) {
+                LogInfo(L"Font %s already exists in [SourceDisksFiles]. Updating entry inline.", vgaFontName.c_str());
+                lines[i] = newLine;
+                alreadyExists = true;
+                break;
+            }
+            
+            targetIndex = i + 1;
+        }
+    }
+
+    if (!sectionFound) {
+        LogError(L"[SourceDisksFiles] section header was not detected in txtsetup.sif.");
+        return;
+    }
+
+    if (!alreadyExists && targetIndex > 0) {
+        lines.insert(lines.begin() + targetIndex, newLine);
+        LogInfo(L"Successfully injected line: '%s' into txtsetup.sif", newLine.c_str());
+    }
+
+    std::wofstream outFile(txtsetupPath, std::ios::trunc);
+    if (!outFile.is_open()) {
+        LogError(L"Failed to open txtsetup.sif for writing: %s", txtsetupPath.c_str());
+        return;
+    }
+
+    for (const auto& l : lines) {
+        outFile << l << L"\n";
+    }
+    outFile.close();
+}
+
 // ---------------------------------------------------------------------------
 // Patching Helper
 // ---------------------------------------------------------------------------
@@ -486,6 +587,8 @@ static void ApplyPatchesToFile(const std::wstring& path, const std::vector<HexEd
         }
     }
 }
+
+
 
 // ---------------------------------------------------------------------------
 // Main Hex Editing Orchestrator
@@ -506,6 +609,22 @@ void ApplyHexEditsToUncompressed(const Paths& p, int spNum) {
     if (!FileExists(sfc_os)) sfc_os = PathJoin(p.procComp, L"SFC_OS.DLL");
 
     LogInfo(L"\n=== Step: Applying Hex Edits ===");
+
+// Intercept IA-64 architecture here
+    if (os == TargetOs::Win2003IA64) {
+        LogInfo(L"Detected Base OS: Windows XP/Server 2003 (IA-64 Itanium)");
+        LogWarn(L"[!] Automated hex patching is impossible for the IA-64 EPIC instruction set.");
+        
+        wprintf(L"\n=================================================================\n");
+        wprintf(L"MANUAL ACTION REQUIRED FOR IA-64 DEPLOYMENT:\n");
+        wprintf(L"Please manually place your pre-patched IA-64 binaries into:\n");
+        wprintf(L"--> %s\n\n", p.procComp.c_str());
+        wprintf(L"Ensure both 'setupapi.dll' and 'syssetup.dll' are replaced.\n");
+        wprintf(L"=================================================================\n\n");
+        
+        Prompt(L"Press [Enter] once you have copied the patched IA-64 files to continue...");
+        return; 
+    }
 
     switch (os) {
         case TargetOs::Win2000:
@@ -625,6 +744,15 @@ void ApplyHelpHtmlOverwrites(const std::wstring& outRoot, const std::wstring& is
     CopyHelpHtmlRecursive(iso2Root, iso2Root, outRoot, count);
     LogInfo(L"  [+] Added/overwrote %d Help/HTML documentation file(s).", count);
 }
+
+static bool IsPureInteger(const std::wstring& s) {
+    if (s.empty()) return false;
+    for (wchar_t c : s) {
+        if (!std::iswdigit(c)) return false;
+    }
+    return true;
+}
+
 
 bool RunPipeline() {
     Paths p;
@@ -805,7 +933,7 @@ bool RunPipeline() {
         LogInfo(L"  renamed %d files in wow_bins.", n);
     }
 
-    // ---------------- Step 5 ----------------
+// ---------------- Step 5 ----------------
     wprintf(L"\n=== Step 5: Extract resources from Resource ISO ===\n");
     // comp_bins / wow_bins were already expanded to real PE extensions in
     // Step 4, so they can be fed directly to the extractor.
@@ -1618,6 +1746,36 @@ std::wstring NlsSectionForLang(DWORD langId) {
 
 } // anonymous namespace
 
+std::wstring ExtractOemHalFont(const std::wstring& nlsBody) {
+    std::wstring targetKey = L"OemHalFont";
+    size_t pos = nlsBody.find(targetKey);
+    if (pos == std::wstring::npos) {
+        return L"";
+    }
+
+    // Locate the equals sign after the key
+    size_t eqPos = nlsBody.find(L"=", pos + targetKey.length());
+    if (eqPos == std::wstring::npos) {
+        return L"";
+    }
+
+    // Find where the line ends (\r or \n)
+    size_t endPos = nlsBody.find_first_of(L"\r\n", eqPos);
+    if (endPos == std::wstring::npos) {
+        endPos = nlsBody.length();
+    }
+
+    // Extract raw value string
+    std::wstring val = nlsBody.substr(eqPos + 1, endPos - (eqPos + 1));
+
+    // Clean up spaces/whitespace surrounding the filename
+    size_t first = val.find_first_not_of(L" \t");
+    if (first == std::wstring::npos) return L"";
+    size_t last = val.find_last_not_of(L" \t");
+    
+    return val.substr(first, (last - first + 1));
+}
+
 static bool PostStep10Fixups(const std::wstring& outRoot,
                              const std::wstring& iso1Root,
                              const std::wstring& iso2Root,
@@ -1808,7 +1966,7 @@ static bool PostStep10Fixups(const std::wstring& outRoot,
 
     // ---------------------------------------------------------------------
     // (VII)-(X) Complex-script language fixups: Chinese Simp./Trad., Korean,
-    // Japanese.
+    // Japanese, Arabic, and Hebrew.
     //
     // These only apply in Replace mode, and only when the target language is
     // one of the complex-script languages we have fixup files for. The fixup
@@ -1908,8 +2066,6 @@ static bool PostStep10Fixups(const std::wstring& outRoot,
                     CopyTreeNoOverwrite(srcDir, dstDir);
                 }
             }
-			LogWarn(L"  Replacing the file spddlang.sys (or .sy_) is required for text-mode setup.", outRoot.c_str());
-			LogWarn(L"  Make sure to keep the architectures same, build number as close as possible.", outRoot.c_str());
         }
 
         // (XI) txtsetup.sif: replace the driver-media descriptor fragment
@@ -1951,7 +2107,7 @@ static bool PostStep10Fixups(const std::wstring& outRoot,
             }
         }
 
-        // (XII) txtsetup.sif: replace the [nls] section wholesale with the
+// (XII) txtsetup.sif: replace the [nls] section wholesale with the
         // hardcoded values for newLang. Complex-script languages (CJK,
         // Arabic, Hebrew) already got their [nls] replaced in Step VII via a
         // fixup file, so only the remaining languages are handled here. If
@@ -1959,23 +2115,30 @@ static bool PostStep10Fixups(const std::wstring& outRoot,
         // complex-script language, the section is left untouched and a
         // warning is emitted.
         {
-            std::wstring nlsBody = NlsSectionForLang(newLang);
-            if (nlsBody.empty()) {
-                if (CjkLangTag(newLang).empty()) {
-                    // Truly unknown language - no fixup file will have patched it either
-                    LogWarn(L"  (XII) no [nls] data for language 0x%04X (%s) - "
-                            L"txtsetup.sif [nls] section must be edited manually",
-                            newLang, LangIdName(newLang));
-                } else {
-                    // Complex-script language: already handled by Step VII
-                    LogInfo(L"  (XII) [nls] for %s already handled by Step VII.",
-                            LangIdName(newLang));
-                }
+            // First, locate the setup file configuration payload
+            std::wstring sifPath = FindOutputFile(outRoot, archDir, L"txtsetup.sif");
+            if (sifPath.empty()) {
+                sifPath = FindOutputFile(outRoot, archDir, L"TXTSETUP.SIF");
+            }
+
+            if (sifPath.empty()) {
+                LogWarn(L"  (XII) txtsetup.sif not found under %s", outRoot.c_str());
             } else {
-                std::wstring sifPath = FindOutputFile(outRoot, archDir, L"txtsetup.sif");
-                if (sifPath.empty()) sifPath = FindOutputFile(outRoot, archDir, L"TXTSETUP.SIF");
-                if (sifPath.empty()) {
-                    LogWarn(L"  (XII) txtsetup.sif not found under %s", outRoot.c_str());
+                bool nlsUpdated = false;
+                std::wstring nlsBody = NlsSectionForLang(newLang);
+
+                if (nlsBody.empty()) {
+                    if (CjkLangTag(newLang).empty()) {
+                        // Truly unknown language - no fixup file will have patched it either
+                        LogWarn(L"  (XII) no [nls] data for language 0x%04X (%s) - "
+                                L"txtsetup.sif [nls] section must be edited manually",
+                                newLang, LangIdName(newLang));
+                    } else {
+                        // Complex-script language: already handled by Step VII
+                        LogInfo(L"  (XII) [nls] for %s already handled by Step VII.",
+                                LangIdName(newLang));
+                        nlsUpdated = true; // Mark true to allow font processing
+                    }
                 } else {
                     // Synthesise a minimal [nls] block and use the existing
                     // section-merge infrastructure to replace wholesale.
@@ -1988,7 +2151,34 @@ static bool PostStep10Fixups(const std::wstring& outRoot,
                         LogInfo(L"  (XII) %s: [nls] replaced for %s",
                                 GetFileNameFromPath(sifPath).c_str(),
                                 LangIdName(newLang));
+                        nlsUpdated = true;
                     }
+                }
+
+                // If the NLS infrastructure is active/ready, append structural font mappings
+                // (XII) Append font file mapping to [SourceDisksFiles] inside txtsetup.sif
+                if (nlsUpdated) {
+                    std::wstring fontFilename;
+                
+                    // Try extracting directly from the matching NlsSectionForLang text block
+                    if (!nlsBody.empty()) {
+                        fontFilename = ExtractOemHalFont(nlsBody);
+                    }
+                
+                    // CJK Layout or extraction fallback logic
+                    if (fontFilename.empty()) {
+                        std::wstring langTag = CjkLangTag(newLang);
+                        if (!langTag.empty()) {
+                            fontFilename = L"vgaoem.fon"; // Standard CJK setup font fallback
+                        } else {
+                            fontFilename = L"vgaoem.fon"; // Generic Western fallback
+                        }
+                    }
+                
+                    LogInfo(L"  (XII) Appending font file mappings (%s) to [SourceDisksFiles] for %s...", 
+                            fontFilename.c_str(), LangIdName(newLang));
+                    
+                    AddFontToSourceDisksFiles(sifPath, fontFilename);
                 }
             }
         }
