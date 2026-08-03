@@ -591,6 +591,168 @@ static void ApplyPatchesToFile(const std::wstring& path, const std::vector<HexEd
 
 
 // ---------------------------------------------------------------------------
+// IA-64: validate + re-stamp manually-copied pre-patched binaries
+// ---------------------------------------------------------------------------
+//
+// The EPIC instruction set on IA-64 makes automated hex patching of
+// setupapi.dll/syssetup.dll infeasible (see ApplyHexEditsToUncompressed).
+// Instead the operator supplies already-patched IA-64 builds of these two
+// files by hand. Once they've done so we can't skip validation: a wrong-arch
+// or wrong-name file dropped in by mistake would silently ship into the
+// output media. This function only "translates" the files in the sense of
+// verifying they are genuine IA-64 PE images and refreshing their checksum
+// field to match the bytes on disk (the checksum a hand-copied file carries
+// almost never matches its origin media, since most patchers alter bytes
+// without re-stamping).
+
+// Minimal PE machine-type sniff. Mirrors SafePatchHeaders' guarded layout
+// walk but only reads the machine field; never touches the checksum here.
+static bool SafeReadPeMachine(BYTE* base, DWORD mapSize, WORD* outMachine) {
+    bool ok = false;
+    __try {
+        const auto dos = (PIMAGE_DOS_HEADER)base;
+        if (dos->e_magic == IMAGE_DOS_SIGNATURE) {
+            LONG off = dos->e_lfanew;
+            if (off > 0 &&
+                (DWORD)off + sizeof(DWORD) + sizeof(IMAGE_FILE_HEADER) <= mapSize) {
+                DWORD sig = *(DWORD*)(base + off);
+                if (sig == IMAGE_NT_SIGNATURE) {
+                    const auto fileHdr =
+                        (PIMAGE_FILE_HEADER)(base + off + sizeof(DWORD));
+                    *outMachine = fileHdr->Machine;
+                    ok = true;
+                }
+            }
+        }
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        ok = false;
+    }
+    return ok;
+}
+
+static bool ReadPeMachineType(const std::wstring& path, WORD& outMachine) {
+    HANDLE hFile = CreateFileW(path.c_str(), GENERIC_READ, FILE_SHARE_READ,
+                               nullptr, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
+    if (hFile == INVALID_HANDLE_VALUE) return false;
+
+    LARGE_INTEGER fsz = {};
+    if (!GetFileSizeEx(hFile, &fsz) || fsz.QuadPart < (LONGLONG)sizeof(IMAGE_DOS_HEADER)) {
+        CloseHandle(hFile);
+        return false;
+    }
+    DWORD mapSize = (DWORD)((fsz.QuadPart < 4096) ? fsz.QuadPart : 4096);
+
+    HANDLE hMap = CreateFileMappingW(hFile, nullptr, PAGE_READONLY, 0, mapSize, nullptr);
+    if (!hMap) { CloseHandle(hFile); return false; }
+
+    LPVOID base = MapViewOfFile(hMap, FILE_MAP_READ, 0, 0, mapSize);
+    if (!base) { CloseHandle(hMap); CloseHandle(hFile); return false; }
+
+    WORD machine = 0;
+    bool ok = SafeReadPeMachine((BYTE*)base, mapSize, &machine);
+    UnmapViewOfFile(base);
+    CloseHandle(hMap);
+    CloseHandle(hFile);
+
+    if (ok) outMachine = machine;
+    return ok;
+}
+
+// Verifies one manually-copied file is a real IA-64 PE image, then re-stamps
+// its checksum (SafeFixCheckSumOne / FixCheckSumOne, same as Step 7 uses for
+// every other binary in the tree) so the header matches the on-disk bytes
+// the operator just placed there.
+static bool TranslateIA64PrepatchedFile(const std::wstring& path) {
+    if (!FileExists(path)) {
+        LogWarn(L"  [IA-64] %s not found - was it actually copied in?",
+                GetFileNameFromPath(path).c_str());
+        return false;
+    }
+
+    WORD machine = 0;
+    if (!ReadPeMachineType(path, machine)) {
+        LogWarn(L"  [IA-64] %s does not look like a valid PE image.",
+                GetFileNameFromPath(path).c_str());
+        return false;
+    }
+    if (machine != IMAGE_FILE_MACHINE_IA64) {
+        LogWarn(L"  [IA-64] %s has machine type 0x%04X, expected IA-64 (0x%04X) - "
+                L"wrong-architecture file may have been copied by mistake.",
+                GetFileNameFromPath(path).c_str(), machine, IMAGE_FILE_MACHINE_IA64);
+        return false;
+    }
+
+    bool ok = SafeFixCheckSumOne(path);
+    if (ok) {
+        LogInfo(L"  [IA-64] %s verified (IA-64 PE) and checksum re-stamped.",
+                GetFileNameFromPath(path).c_str());
+    } else {
+        LogWarn(L"  [IA-64] %s is a valid IA-64 PE but its checksum could not be "
+                L"re-stamped; setup may reject it.", GetFileNameFromPath(path).c_str());
+    }
+    return ok;
+}
+
+// Runs the check above over both files the operator was asked to replace.
+// Called right after the "press Enter to continue" prompt so any mistake is
+// caught immediately instead of surfacing later as a setup failure on real
+// IA-64 hardware.
+//
+// The operator drops the pre-patched files into p.iso1CompBins (ISO_1\comp_bins),
+// i.e. alongside the rest of the Base ISO's staged binaries, rather than
+// directly into p.procComp (ISO_1_processed\comp_bins). This keeps the
+// distinction between "Base ISO inputs" and "pipeline outputs" consistent:
+// nothing is ever hand-placed straight into the processed/output tree.
+//
+// Once verified, only these two files get their resources replaced - not the
+// whole comp_bins folder (ReplaceResources operates on an entire directory,
+// and everything else in comp_bins was already processed back in Step 6).
+// To scope it down to just these two files, they're mirrored into a private
+// temp staging folder, ReplaceResources is run on that folder alone, and the
+// two results are copied over into p.procComp.
+static bool TranslateManualIA64Binaries(const Paths& p) {
+    std::wstring setupapi = PathJoin(p.iso1CompBins, L"setupapi.dll");
+    if (!FileExists(setupapi)) setupapi = PathJoin(p.iso1CompBins, L"SETUPAPI.DLL");
+
+    std::wstring syssetup = PathJoin(p.iso1CompBins, L"syssetup.dll");
+    if (!FileExists(syssetup)) syssetup = PathJoin(p.iso1CompBins, L"SYSSETUP.DLL");
+
+    LogInfo(L"  [IA-64] Validating manually-copied pre-patched binaries...");
+    bool okSetupapi = TranslateIA64PrepatchedFile(setupapi);
+    bool okSyssetup = TranslateIA64PrepatchedFile(syssetup);
+
+    if (!okSetupapi || !okSyssetup) {
+        LogWarn(L"  [IA-64] One or more files failed validation. Re-check the "
+                L"copied binaries before proceeding.");
+        return false;
+    }
+
+    // Stage just these two files in an isolated temp folder so
+    // ReplaceResources (which processes a whole directory) only ever sees
+    // them, not the rest of comp_bins.
+    std::wstring stageDir = PathJoin(p.procRoot, L"ia64_stage_comp");
+    MakeDirs(stageDir);
+
+    std::wstring stagedSetupapi = PathJoin(stageDir, GetFileNameFromPath(setupapi));
+    std::wstring stagedSyssetup = PathJoin(stageDir, GetFileNameFromPath(syssetup));
+    bool okStage = CopyFileForce(setupapi, stagedSetupapi) &&
+                   CopyFileForce(syssetup, stagedSyssetup);
+    if (!okStage) {
+        LogWarn(L"  [IA-64] Could not stage setupapi.dll/syssetup.dll for "
+                L"resource replacement.");
+        return false;
+    }
+
+    LogInfo(L"  [IA-64] Replacing resources for setupapi.dll / syssetup.dll...");
+    bool okReplace = ReplaceResources(stageDir, p.resources, p.procComp, false);
+    if (!okReplace) {
+        LogWarn(L"  [IA-64] Resource replacement failed for one or more of the "
+                L"IA-64 binaries; check %s.", p.procComp.c_str());
+    }
+    return okReplace;
+}
+
+// ---------------------------------------------------------------------------
 // Main Hex Editing Orchestrator
 // ---------------------------------------------------------------------------
 
@@ -618,11 +780,18 @@ void ApplyHexEditsToUncompressed(const Paths& p, int spNum) {
         wprintf(L"\n=================================================================\n");
         wprintf(L"MANUAL ACTION REQUIRED FOR IA-64 DEPLOYMENT:\n");
         wprintf(L"Please manually place your pre-patched IA-64 binaries into:\n");
-        wprintf(L"--> %s\n\n", p.procComp.c_str());
+        wprintf(L"--> %s\n\n", p.iso1CompBins.c_str());
         wprintf(L"Ensure both 'setupapi.dll' and 'syssetup.dll' are replaced.\n");
+        wprintf(L"They will be verified, then have their resources replaced into:\n");
+        wprintf(L"--> %s\n", p.procComp.c_str());
         wprintf(L"=================================================================\n\n");
         
         Prompt(L"Press [Enter] once you have copied the patched IA-64 files to continue...");
+
+        if (!TranslateManualIA64Binaries(p)) {
+            LogWarn(L"[!] IA-64 setupapi.dll/syssetup.dll processing did not complete "
+                    L"successfully; check the warnings above before shipping this media.");
+        }
         return; 
     }
 
@@ -1005,6 +1174,35 @@ bool RunPipeline() {
     // 8c) driver merge + Driver.cab
     LogInfo(L"  (c) merging driver_bins and rebuilding Driver.cab");
     CopyTreeNoOverwrite(p.iso1DriverBins, p.procDriver);
+
+    // Windows 2000: driver.cab ships its own copy of KERNEL32.DLL. Before
+    // the CAB is rebuilt, copy+replace the original (unpatched) KERNEL32.DLL
+    // from the Base ISO into driver_bins so the CAB carries the same
+    // untouched binary as the rest of the output (see the VI-b restore in
+    // PostStep10Fixups).
+    if (DetectBaseOs(p.iso1) == TargetOs::Win2000) {
+        const wchar_t* names[] = { L"KERNEL32.DLL", L"kernel32.dll",
+                                   L"KERNEL32.DL_", L"kernel32.dl_" };
+        bool copied = false;
+        for (const wchar_t* sub : { ArchDirName(arch1), L"I386", L"" }) {
+            for (const wchar_t* n : names) {
+                std::wstring cand = (*sub) ? PathJoin(p.iso1, sub, n)
+                                           : PathJoin(p.iso1, n);
+                if (!FileExists(cand)) continue;
+                std::wstring dst = PathJoin(p.procDriver, L"KERNEL32.DLL");
+                if (CopyFileForce(cand, dst)) {
+                    LogInfo(L"  (c)   Win2000: KERNEL32.DLL copied into driver_bins -> %s", dst.c_str());
+                    copied = true;
+                }
+            }
+            if (copied) break;
+        }
+        if (!copied) {
+            LogWarn(L"  (c)   Win2000: KERNEL32.DLL/.DL_ not found on Base ISO - "
+                    L"driver_bins may retain a patched copy.");
+        }
+    }
+
     {
         std::wstring drvOut = PathJoin(outArchDir, L"Driver.cab");
         BuildCab(p.procDriver, drvOut);
@@ -1961,6 +2159,44 @@ static bool PostStep10Fixups(const std::wstring& outRoot,
         if (!restored) {
             LogWarn(L"  (VI-b) dssenh.DLL/.DL_ not found on Base ISO - "
                     L"output may contain a resource-patched copy.");
+        }
+    }
+
+    // (VI-c) Windows 2000 only: on Win2000 media, DSSENH.DLL and RSAENH.DLL
+    // are instead named DSSBASE.DLL and RSABASE.DLL respectively. Copy these
+    // original files from the Base ISO into the equivalent output location
+    // so the CSP DLLs remain unpatched, matching the DSSENH/RSAENH handling
+    // above on later OS versions. INITPKI.DLL needs no special handling on
+    // Windows 2000 and is left as produced by the earlier pipeline steps.
+    if (DetectBaseOs(iso1Root) == TargetOs::Win2000) {
+        struct BaseFile { const wchar_t* upper; const wchar_t* lower; const wchar_t* label; };
+        const BaseFile baseFiles[] = {
+            { L"DSSBASE.DLL", L"dssbase.dll", L"dssbase" },
+            { L"RSABASE.DLL", L"rsabase.dll", L"rsabase" },
+        };
+        for (const auto& bf : baseFiles) {
+            const wchar_t* names[] = { bf.upper, bf.lower };
+            bool restored = false;
+            for (const wchar_t* sub : { archDir, L"I386", L"" }) {
+                for (const wchar_t* n : names) {
+                    std::wstring cand = (*sub) ? PathJoin(iso1Root, sub, n)
+                                               : PathJoin(iso1Root, n);
+                    if (!FileExists(cand)) continue;
+
+                    std::wstring rel = cand.substr(iso1Root.size());
+                    while (!rel.empty() && (rel[0] == L'\\' || rel[0] == L'/')) rel.erase(0, 1);
+                    std::wstring dst = PathJoin(outRoot, rel);
+                    if (CopyFileForce(cand, dst)) {
+                        LogInfo(L"  (VI-c) Win2000: %s restored unpatched from Base -> %s",
+                                bf.label, dst.c_str());
+                        restored = true;
+                    }
+                }
+            }
+            if (!restored) {
+                LogWarn(L"  (VI-c) Win2000: %s not found on Base ISO - "
+                        L"output may contain a resource-patched copy.", bf.label);
+            }
         }
     }
 
