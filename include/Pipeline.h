@@ -41,5 +41,7 @@ bool HasServicePackCab(const std::wstring& mediaRoot,
 // Run the full pipeline. Returns true on success.
 bool RunPipeline();
 
-// Re-stamp the PE checksum on every PE file in dir (recursive).
-bool FixCheckSumsInTree(const std::wstring& dir);
+// Re-stamp the PE checksum on every PE file in dir (recursive).  If
+// isExcluded is non-null, matching files are skipped (left byte-for-byte
+// untouched) - used by Safe mode for the kernel/HAL images.
+bool FixCheckSumsInTree(const std::wstring& dir, ResourceExcludeFn isExcluded = nullptr);

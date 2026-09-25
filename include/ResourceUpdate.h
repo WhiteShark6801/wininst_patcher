@@ -10,9 +10,11 @@ bool IsPEFile(const std::wstring& filepath);
 //   2. Open with BeginUpdateResource and overwrite every resource that has a
 //      matching .bin in resourceFolder (filename-prefixed by the PE file's
 //      basename).  Excluded types: 1,2,3,12,14,16,24.
+// If isExcluded is non-null and rejects the file, it is copied unchanged.
 // If skipEmpty is true and no resources were updated, the output copy is
 // removed afterwards.
 bool ReplaceResources(const std::wstring& inputFolder,
                       const std::wstring& resourceFolder,
                       const std::wstring& outputFolder,
-                      bool skipEmpty);
+                      bool skipEmpty,
+                      ResourceExcludeFn isExcluded = nullptr);

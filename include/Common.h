@@ -10,11 +10,19 @@
 #include <cstdio>
 #include <cstdint>
 
+// Optional per-file filter used by the resource pipeline. If non-null and
+// returns true for a PE file's basename (e.g. "ntoskrnl.exe"), the file is
+// passed through untouched - its resources are never replaced, nor is its PE
+// checksum re-stamped (Safe mode excludes the boot-critical kernel/HAL set).
+using ResourceExcludeFn = bool (*)(const std::wstring& fileName);
+
 // Architecture detected from media root
 enum class Arch {
     X86,    // I386 only
     AMD64,  // AMD64 + I386 (WOW)
-    IA64    // IA64  + I386 (WOW)
+    IA64,   // IA64  + I386 (WOW)
+    ALPHA,  // ALPHA only (32-bit DEC Alpha)
+    AXP64   // AXP64 + I386 (WOW, 64-bit Alpha AXP)
 };
 
 // Returns the literal subdirectory name on the media for a given arch
@@ -23,8 +31,15 @@ inline const wchar_t* ArchDirName(Arch a) {
         case Arch::X86:   return L"I386";
         case Arch::AMD64: return L"AMD64";
         case Arch::IA64:  return L"IA64";
+        case Arch::ALPHA: return L"ALPHA";
+        case Arch::AXP64: return L"AXP64";
     }
     return L"I386";
+}
+
+// True if the architecture is 64-bit and has an I386 WOW directory
+inline bool IsArch64(Arch a) {
+    return a == Arch::AMD64 || a == Arch::IA64 || a == Arch::AXP64;
 }
 
 // Logging
@@ -69,6 +84,10 @@ std::vector<std::wstring> ListFilesByExt(const std::wstring& dir,
 // Clear the read-only / hidden / system attributes on every file in `dir`
 // (non-recursive). No-op if the directory doesn't exist.
 void ClearReadOnlyInDir(const std::wstring& dir);
+
+// Recursively clear the read-only / hidden / system attributes on every file
+// under `root` (including subdirectories). No-op if the directory doesn't exist.
+void ClearReadOnlyTree(const std::wstring& root);
 
 // Run a command line, wait for completion, return exit code (or -1 on failure)
 int RunCommand(const std::wstring& cmdLine, const std::wstring& workingDir = L"");
