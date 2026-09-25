@@ -8,13 +8,14 @@ Integrate multilingual resources into Windows NT 5.x (Windows 2000, XP, Server 2
 
 ## Features
 
-- **Multi-architecture support**: x86 (I386), x64 (AMD64), and IA64 (Itanium)
+- **Multi-architecture support**: x86 (I386), x64 (AMD64), IA64 (Itanium), DEC Alpha (ALPHA), and Alpha AXP 64-bit (AXP64)
 - **Language resource extraction**: Automatically extracts .RES/.MUI resources from PE files
 - **PE resource patching**: Merges donor language resources into base ISO binaries
 - **PE checksum re-stamping**: Recalculates and updates PE headers to pass signature checks
 - **Automatic layout detection**: Detects Windows 2000, XP, and Server 2003 variants
 - **Cross-architecture support**: Handles WOW64 (32-bit on 64-bit) binary mapping
 - **Service pack integration**: Merges SP*.CAB files during patching
+- **CJK donor-media merge**: For Chinese/Japanese/Korean targets, combines the donor `txtsetup.sif` `[WinntDirectories]`/`[SourceDisksFiles]` sections into the output and copies missing donor arch files (no overwrite)
 - **Logging**: Comprehensive timestamped logs for debugging failed runs
 
 ---
@@ -32,14 +33,17 @@ Integrate multilingual resources into Windows NT 5.x (Windows 2000, XP, Server 2
   - C++17 standard support
 
 ### Media
-- **Base ISO** (writable, extracted directory)
+- **Base ISO** (extracted directory or mounted CD/DVD)
   - Windows 2000, XP, or Server 2003 installation media
   - Must have I386, AMD64, or IA64 subdirectory
-- **Resource ISO** (writable, extracted directory)
+- **Resource ISO** (extracted directory or mounted CD/DVD)
   - Same OS, different language variant
   - Should have matching architecture
 
-> ⚠️ **Important**: Both ISOs must be extracted to writable directories on disk. Mounted ISOs (read-only) will fail during processing.
+> Mounted CD/DVD drives can be used directly as Base and/or Resource media. The
+> tool reads them read-only (no copies of the full media are needed, saving
+> 700–800 MB of staging space) and clears the read-only attribute that CD/DVD
+> files carry from the output folder before the post-cleanup fixups.
 
 ---
 
@@ -68,7 +72,7 @@ The `build.cmd` script:
 
 ### Basic Workflow
 
-1. **Extract both ISOs to writable directories**
+1. **Prepare both ISOs** (extract to a writable directory, or mount the CD/DVD)
    ```
    ISO 1: E:\BaseISO       (Windows XP English)
    ISO 2: E:\DonorISO      (Windows XP French)
@@ -89,7 +93,7 @@ The `build.cmd` script:
      Base ISO: 0x0409 (English - United States)
      Resource ISO: 0x040c (French)
    
-   Mode [A/R]: R
+   Mode [S/F]: F
    ```
 
 4. **Wait** (15–20 minutes, depending on media size)
@@ -113,7 +117,7 @@ wininst_patcher.exe [-v|--verbose] [-h|--help]
 - **Base ISO**: The target media to be patched (languages preserved, layout unchanged)
 - **Resource ISO**: Donor media supplying translated resources
 
-Both must be extracted, writable directories with recognized architecture subdirectories (I386, AMD64, IA64).
+Both must be directories with recognized architecture subdirectories (I386, AMD64, IA64) — either extracted folders on disk or mounted CD/DVD drives.
 
 #### Step 2: Output Folder
 - Will be created if it doesn't exist
@@ -121,11 +125,13 @@ Both must be extracted, writable directories with recognized architecture subdir
 - Contains the patched media tree (ready for nLite)
 
 #### Step 3: Language Detection & Mode
-The tool auto-detects language IDs from `hivedef.inf` (INTL_LOCALE):
-- **Attach mode (A)**: Resources added alongside existing language; OS picks via fallback
-- **Replace mode (R)**: Extracted .bin files renamed to overwrite base language; language ID changed in `intl.inf`, `hivesys.inf`, `hivedef.inf`
+The tool auto-detects language IDs from `hivedef.inf` (INTL_LOCALE). Resources are **always** applied in Replace fashion (the old Attach mode has been retired): extracted `.bin` files are renamed to overwrite the Base language, and the language ID is updated in `intl.inf`, `hivesys.inf`, `hivedef.inf`.
 
-If language detection fails, mode defaults to Attach.
+Choose a processing mode (prompt `Mode [S/F]`):
+- **Safe (S)**: Boot-critical files are left untouched — `ntoskrnl.exe`, `ntkr*.dll`, and `hal*.dll` pass through unchanged (no resource replacement, no checksum re-stamp), and `driver.cab` / `SP*.CAB` are not processed. The original archives are kept on the output media.
+- **Full (F)**: Everything is processed like usual — every PE binary gets its resources replaced, PE checksums are re-stamped, and `Driver.cab` / `SP*.CAB` are rebuilt.
+
+If language detection fails for either ISO, replacements still happen but the extracted `.bin` files cannot be renamed to the Base language.
 
 ---
 
@@ -170,8 +176,8 @@ This tree is ready for import into **nLite** or other ISO repackaging tools.
 - Separates by type:
   - `comp_bins`: Compressed PE files (will be re-compressed later)
   - `uncomp_bins`: Already-uncompressed binaries
-  - `driver_bins`: Extracted from Driver.cab
-  - `servicepack_bins`: Extracted from SP*.CAB (if present)
+  - `driver_bins`: Extracted from Driver.cab (skipped in Safe mode)
+  - `servicepack_bins`: Extracted from SP*.CAB (if present; skipped in Safe mode)
   - `wow_bins`: WOW64 binaries (on 64-bit media only)
 
 **Step 5: Resource Extraction**
@@ -182,22 +188,25 @@ This tree is ready for import into **nLite** or other ISO repackaging tools.
 **Step 6: Resource Replacement**
 - Patches each base ISO binary with donor resources
 - Merges string tables, dialogs, menus, accelerators
-- In Replace mode, renames language-specific files (.bin) to overwrite base language
+- Always runs in Replace fashion: language-specific files (.bin) are renamed to overwrite the base language
+- In Safe mode, `ntoskrnl.exe`, `ntkr*.dll`, and `hal*.dll` are copied through untouched; `driver_bins` and `servicepack_bins` are not processed
 
 **Step 7: Hex Patching (OS-specific)**
 - Applies hand-coded binary patches to `setupapi.dll`, `syssetup.dll`, `sfc_os.dll`
 - Patterns vary by OS version (Win2000, WinXP, Win2003, Win2003x64)
-- IA64: Requires manual pre-patched binaries (EPIC instruction set not amenable to automated patching)
+- IA64, DEC Alpha (ALPHA), and Alpha AXP 64-bit (AXP64): Requires manual pre-patched binaries (EPIC/RISC instruction sets are not amenable to automated patching)
+- ALPHA / AXP64 media is treated strictly as Windows 2000 (no XP/Server 2003 exists for it), including the Win2000 KERNEL32/DSSBASE/RSABASE handling — the hex-patching step alone stays manual like IA64
 
 **Step 8: PE Checksum Re-stamping**
 - Walks entire output tree recursively
 - Recalculates and updates PE header checksums
 - Ensures binaries pass Windows setup signature checks
+- In Safe mode, the excluded kernel/HAL files are not re-stamped
 
 **Step 9: Re-compression**
 - Compressed files (`.comp_bins`) re-packed into output architecture directory
 - Uncompressed files copied as-is
-- Driver.cab and SP*.CAB rebuilt
+- Driver.cab and SP*.CAB rebuilt (in Safe mode the original archives are kept)
 
 **Step 10: Media Assembly**
 - Copies all remaining files from base ISO (boot, config, docs)
@@ -205,9 +214,15 @@ This tree is ready for import into **nLite** or other ISO repackaging tools.
 - Preserves directory structure
 
 **Post-Step 10: Fixups**
+- When Base/Resource came from mounted CD/DVD media, clears the read-only attribute on the whole output tree (needed so INF edits can succeed)
 - Copies unpatched critical system files (KERNEL32.DLL, PIDGEN.DLL, rsaenh.DLL, dssenh.DLL)
 - Updates locale settings in INF files (intl.inf, hivesys.inf, hivedef.inf)
 - Merges complex-script language files (Chinese, Japanese, Korean)
+- For CJK targets: merges the **donor** `txtsetup.sif` data into the output —
+  - All donor `[WinntDirectories]` sections are combined and appended to the output (duplicate keys are detected and skipped)
+  - The correct donor `[SourceDisksFiles]` block (the one declaring the `c_10003.nls` codepage table) is appended to the output
+  - Files from `donor\<donor_arch>` are copied into `output\<base_arch>` **without overwriting** existing files
+  - The `[WinntDirectories]`/`[SourceDisksFiles]` placeholders inside the `txtsetup_1028/1041/1042/2052.txt` fixup files are ignored (they are only templates)
 - Copies Help/HTML documentation from donor ISO
 - Updates txtsetup.sif with new language metadata
 
@@ -215,9 +230,17 @@ This tree is ready for import into **nLite** or other ISO repackaging tools.
 
 ## Known Limitations & Workarounds
 
-### Q: Japanese and Korean ISOs fail during text-mode setup. Why?
+### Q: Do Chinese/Japanese/Korean targets have special requirements?
 
-**A:** Japanese and Korean builds fail signature checks on critical setup DLLs during GUI-mode setup. Root cause is complex-script font and NLS data dependencies. Currently unsupported; a deeper binary patch strategy would be needed.
+**A:** CJK targets (Chinese Simplified `2052`, Chinese Traditional `1028`, Korean `1042`, Japanese `1041`) need additional donor media data that Western base ISOs lack. The tool now handles this automatically in **Post-Step 10**:
+- The donor `txtsetup.sif` `[WinntDirectories]` sections are combined into the output — correct for translations like English Base → Korean Donor.
+- The correct donor `[SourceDisksFiles]` block (containing the `c_10003.nls` codepage entry) is merged into the output so text-mode setup finds all the language-specific install files.
+- Missing donor files are layered into the output arch folder (`donor\<donor_arch>` → `output\<base_arch>`) without overwriting existing files.
+- The `txtsetup_<LCID>.txt` fixup files only supply placeholder section templates; their `[WinntDirectories]`/`[SourceDisksFiles]` content is deliberately skipped (the real data comes from the donor ISO).
+
+Korean translations have been verified to work end-to-end with this merge. Ensure the donor ISO is the matching CJK language and that the donor architecture directory exists.
+
+> **Note:** `winnt32bbu.dll` (the setup billboard) can be buggy for these languages — it may display garbled or untranslated text. This is a known cosmetic issue with the billboard during WinNT32 setup, unrelated to the txtsetup.sif merge.
 
 ### Q: Chinese characters are corrupted during text-mode setup.
 
@@ -252,6 +275,14 @@ Donor = Any language Windows Server 2003 x86 + Any language Windows XP SP2 binar
 
 This mix works because x64 Edition shares core binaries with Server 2003 but WOW64 compatibility layer (32-bit support) comes from XP SP2.
 
+### Q: How do I patch DEC Alpha (ALPHA) or Alpha AXP 64-bit (AXP64) media?
+
+**A:** These architectures are treated strictly as Windows 2000 (no XP/Server 2003 releases exist for them), receiving the Windows 2000 x86-like handling (Win2000 hex-patch baseline, unpatched KERNEL32/DSSBASE/RSABASE restoration). The hex-patching step itself works like IA64:
+1. Obtain pre-patched `setupapi.dll` and `syssetup.dll` for your Alpha/AXP build
+2. Place them in the tool's input directory
+3. When prompted, copy them to the indicated staging folder
+4. The tool will validate the architecture and re-stamp checksums
+
 ### Q: Manual action required for IA64 deployments?
 
 **A:** Yes. The EPIC instruction set (IA64) makes automated hex patching infeasible. You must:
@@ -285,7 +316,8 @@ This mix works because x64 Edition shares core binaries with Server 2003 but WOW
 
 ### Language Not Applied
 - Verify language detection worked (check logfile for detected LANGID)
-- Check Replace mode was selected (not Attach)
+- Resources are always applied in Replace fashion (Attach mode was retired)
+- If you chose **Safe mode**, boot-critical files (`ntoskrnl.exe`, `ntkr*.dll`, `hal*.dll`) are intentionally left unpatched — re-run with **Full mode** to process them
 - Verify both ISOs had the same OS version (WinXP + WinXP, not WinXP + Win2003)
 - Ensure donor ISO was a complete, valid installation media (not a partial update)
 
@@ -319,9 +351,10 @@ Bug reports and pull requests are welcome. Please include:
 
 | Q | A |
 |---|---|
-| **Can I use CD instead of DVD?** | Yes; media type doesn't matter, only extracted directory layout. |
+| **Can I use CD instead of DVD?** | Yes; media type doesn't matter. Both media may be mounted CD/DVD drives used directly, or extracted folders on disk. |
 | **How long does patching take?** | Typically 15–20 minutes on a modern SSD, longer on HDDs. |
 | **Can I patch multiple languages at once?** | No; run the tool separately for each language pair. |
+| **Do CJK targets (Chinese/Japanese/Korean) need anything extra?** | Yes — use the matching CJK language as the Resource/donor ISO. The tool merges the donor's `txtsetup.sif` sections (`[WinntDirectories]`, `[SourceDisksFiles]`) and copies missing donor files in Post-Step 10. |
 | **Will this work on Windows 7+ ISOs?** | No. This tool targets Windows 2000, XP, and Server 2003 (NT 5.x) only. |
 | **Do I need nLite?** | Yes, to repackage the output into a bootable ISO. |
 | **Can I use the output directly without nLite?** | Only if you manually construct the ISO with correct boot sectors and file layout. |
