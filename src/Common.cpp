@@ -198,17 +198,25 @@ bool RemoveTree(const std::wstring& path) {
     return true;
 }
 
+static void StripReadOnly(const std::wstring& path) {
+    DWORD a = GetFileAttributesW(path.c_str());
+    if (a != INVALID_FILE_ATTRIBUTES && (a & FILE_ATTRIBUTE_READONLY)) {
+        SetFileAttributesW(path.c_str(), a & ~FILE_ATTRIBUTE_READONLY);
+    }
+}
+
 bool CopyFileForce(const std::wstring& src, const std::wstring& dst) {
     MakeDirs(GetDirFromPath(dst));
     // Clear read-only attribute on existing destination
-    DWORD a = GetFileAttributesW(dst.c_str());
-    if (a != INVALID_FILE_ATTRIBUTES && (a & FILE_ATTRIBUTE_READONLY)) {
-        SetFileAttributesW(dst.c_str(), a & ~FILE_ATTRIBUTE_READONLY);
-    }
+    StripReadOnly(dst);
     if (!CopyFileW(src.c_str(), dst.c_str(), FALSE)) {
         LogError(L"CopyFile failed (%lu): %s -> %s", GetLastError(), src.c_str(), dst.c_str());
         return false;
     }
+    // The source may live on read-only media (mounted CD/DVD), whose files all
+    // carry FILE_ATTRIBUTE_READONLY. CopyFileW propagates source attributes to
+    // the destination, so re-strip it after the copy to keep the output writable.
+    StripReadOnly(dst);
     return true;
 }
 
@@ -221,6 +229,9 @@ bool CopyFileNoOverwrite(const std::wstring& src, const std::wstring& dst) {
         LogError(L"CopyFile failed (%lu): %s -> %s", e, src.c_str(), dst.c_str());
         return false;
     }
+    // See CopyFileForce: strip the read-only attribute that read-only media
+    // sources propagate onto the fresh destination.
+    StripReadOnly(dst);
     return true;
 }
 
@@ -272,6 +283,22 @@ void ClearReadOnlyInDir(const std::wstring& dir) {
             DWORD newAttrs = a & ~strip;
             if (newAttrs == 0) newAttrs = FILE_ATTRIBUTE_NORMAL;
             SetFileAttributesW(full.c_str(), newAttrs);
+        }
+    } while (FindNextFileW(h, &fd));
+    FindClose(h);
+}
+
+void ClearReadOnlyTree(const std::wstring& root) {
+    if (!DirExists(root)) return;
+    ClearReadOnlyInDir(root);
+    WIN32_FIND_DATAW fd = {};
+    std::wstring pattern = PathJoin(root, L"*");
+    HANDLE h = FindFirstFileW(pattern.c_str(), &fd);
+    if (h == INVALID_HANDLE_VALUE) return;
+    do {
+        if (wcscmp(fd.cFileName, L".") == 0 || wcscmp(fd.cFileName, L"..") == 0) continue;
+        if (fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) {
+            ClearReadOnlyTree(PathJoin(root, fd.cFileName));
         }
     } while (FindNextFileW(h, &fd));
     FindClose(h);

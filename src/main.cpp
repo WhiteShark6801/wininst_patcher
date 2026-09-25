@@ -35,7 +35,7 @@ int wmain(int argc, wchar_t* argv[]) {
               L"  1. Base ISO root        (target media to be patched)\n"
               L"  2. Resource ISO root    (donor media supplying resources)\n"
               L"  3. Output dir           (will hold the patched media tree)\n"
-              L"  4. Mode (Attach/Replace)\n");
+              L"  4. Mode (Safe/Full)\n");
             return 0;
         }
     }

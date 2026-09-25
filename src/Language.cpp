@@ -79,7 +79,7 @@ bool LooksLikeIntlLocaleLine(const std::wstring& line, std::wstring& outValue) {
 // <media>\I386\HIVEDEF.IN_  (compressed) or HIVEDEF.INF in service-pack
 // integrated images. On AMD64/IA64 it's mirrored under that arch dir.
 std::wstring FindHivedef(const std::wstring& mediaRoot) {
-    const wchar_t* subs[] = { L"I386", L"AMD64", L"IA64", L"" };
+    const wchar_t* subs[] = { L"I386", L"AMD64", L"IA64", L"AXP64", L"ALPHA", L"" };
     const wchar_t* names[] = {
         L"hivedef.inf", L"HIVEDEF.INF",
         L"hivedef.in_", L"HIVEDEF.IN_"

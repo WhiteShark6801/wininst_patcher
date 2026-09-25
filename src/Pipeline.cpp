@@ -10,6 +10,7 @@
 #pragma comment(lib, "imagehlp.lib")
 #include <algorithm>
 #include <cwctype>
+#include <map>
 #include <set>
 #include <fstream>
 #include <string>
@@ -37,13 +38,17 @@ static bool PostStep10Fixups(const std::wstring& outRoot, const std::wstring& is
 bool DetectArch(const std::wstring& mediaRoot, Arch& outArch) {
     std::wstring ia64  = PathJoin(mediaRoot, L"IA64");
     std::wstring amd64 = PathJoin(mediaRoot, L"AMD64");
+    std::wstring axp64 = PathJoin(mediaRoot, L"AXP64");
+    std::wstring alpha = PathJoin(mediaRoot, L"ALPHA");
     std::wstring i386  = PathJoin(mediaRoot, L"I386");
 
     if (DirExists(ia64))       { outArch = Arch::IA64;  return true; }
     if (DirExists(amd64))      { outArch = Arch::AMD64; return true; }
+    if (DirExists(axp64))      { outArch = Arch::AXP64; return true; }
+    if (DirExists(alpha))      { outArch = Arch::ALPHA; return true; }
     if (DirExists(i386))       { outArch = Arch::X86;   return true; }
 
-    LogError(L"No I386/AMD64/IA64 directory under %s", mediaRoot.c_str());
+    LogError(L"No I386/AMD64/IA64/AXP64/ALPHA directory under %s", mediaRoot.c_str());
     return false;
 }
 
@@ -51,7 +56,7 @@ bool HasServicePackCab(const std::wstring& mediaRoot,
                        std::wstring& outCabFile, int& outSpNum) {
     // Service pack CABs sit in the I386 directory on every NT-family install
     // medium I've seen.  Check both the root and I386.
-    const wchar_t* candidates[] = { L"I386", L"AMD64", L"IA64", L"" };
+    const wchar_t* candidates[] = { L"I386", L"AMD64", L"IA64", L"AXP64", L"ALPHA", L"" };
     for (const wchar_t* sub : candidates) {
         std::wstring dir = (*sub) ? PathJoin(mediaRoot, sub) : mediaRoot;
         for (int n = 1; n <= 4; ++n) {
@@ -187,7 +192,7 @@ static bool SafeFixCheckSumOne(const std::wstring& path) {
     return r;
 }
 
-bool FixCheckSumsInTree(const std::wstring& dir) {
+bool FixCheckSumsInTree(const std::wstring& dir, ResourceExcludeFn isExcluded) {
     if (!DirExists(dir)) return true;
 
     WIN32_FIND_DATAW fd = {};
@@ -200,8 +205,14 @@ bool FixCheckSumsInTree(const std::wstring& dir) {
         if (wcscmp(fd.cFileName, L".") == 0 || wcscmp(fd.cFileName, L"..") == 0) continue;
         std::wstring full = PathJoin(dir, fd.cFileName);
         if (fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) {
-            FixCheckSumsInTree(full);
+            FixCheckSumsInTree(full, isExcluded);
         } else if (IsPEFile(full)) {
+            // Safe mode: excluded boot-critical files pass through untouched,
+            // not even their PE checksum header is re-stamped.
+            if (isExcluded && isExcluded(fd.cFileName)) {
+                LogDebug(L"  checksum skipped (Safe mode): %s", fd.cFileName);
+                continue;
+            }
             total++;
             LogDebug(L"  checksumming %s", fd.cFileName);
             bool r = SafeFixCheckSumOne(full);
@@ -314,9 +325,9 @@ static bool PopulateFromMedia(const std::wstring& mediaRoot,
     }
 
     // (c) Driver.cab -> driver_bins
-    {
+    if (!driverBins.empty()) {
         std::wstring drvCab;
-        for (const wchar_t* sub : { L"I386", L"AMD64", L"IA64" }) {
+        for (const wchar_t* sub : { L"I386", L"AMD64", L"IA64", L"AXP64", L"ALPHA" }) {
             std::wstring p = PathJoin(mediaRoot, sub, L"DRIVER.CAB");
             if (FileExists(p)) { drvCab = p; break; }
             p = PathJoin(mediaRoot, sub, L"Driver.cab");
@@ -324,18 +335,22 @@ static bool PopulateFromMedia(const std::wstring& mediaRoot,
         }
         if (!drvCab.empty()) ExtractCab(drvCab, driverBins);
         else                 LogWarn(L"  Driver.cab not found on %s", mediaRoot.c_str());
+    } else {
+        LogInfo(L"  driver.cab: skipped");
     }
 
     // (d) SP*.CAB -> servicepack_bins
-    {
+    if (!spBins.empty()) {
         std::wstring spCab; int spNum = 0;
         if (HasServicePackCab(mediaRoot, spCab, spNum)) ExtractCab(spCab, spBins);
         else                                            LogInfo(L"  No SP*.CAB on %s", mediaRoot.c_str());
+    } else {
+        LogInfo(L"  SP*.CAB: skipped");
     }
 
     // (e) 64-bit only: WOW = compressed PE files in the *root* \I386 dir.
     // (On 32-bit media there is no WOW; \I386 is the native dir handled above.)
-    if (arch == Arch::AMD64 || arch == Arch::IA64) {
+    if (IsArch64(arch)) {
         if (DirExists(i386)) {
             int n = 0;
             for (const auto& f : ListFilesByExt(i386, COMP_EXTS)) {
@@ -419,6 +434,20 @@ static std::wstring AskDir(const wchar_t* prompt, bool mustExist) {
     }
 }
 
+// Returns true if `path` resides on a mounted CD/DVD drive. Accepts a drive
+// root, a path with or without a trailing slash, or a drive-relative path.
+static bool IsOpticalMedia(const std::wstring& path) {
+    std::wstring root;
+    if (path.size() >= 2 && path[1] == L':') {
+        root = std::wstring(1, path[0]) + L":\\";
+    } else if (path.size() >= 2 && path[0] == L'\\' && path[1] == L'\\') {
+        return false; // UNC share - treat as regular folder
+    } else {
+        return false;
+    }
+    return GetDriveTypeW(root.c_str()) == DRIVE_CDROM;
+}
+
 // ---------------------------------------------------------------------------
 // Hex Editing Structures & Enumerations
 // ---------------------------------------------------------------------------
@@ -428,7 +457,7 @@ enum class TargetOs {
     WinXP,
     Win2003,
     Win2003x64,
-	Win2003IA64 // Added for Itanium support
+	Win2003IA64    // Itanium: folder IA64 only
 };
 
 struct HexEditDef {
@@ -447,6 +476,15 @@ static TargetOs DetectBaseOs(const std::wstring& iso1Root) {
     }
 	if (DirExists(PathJoin(iso1Root, L"IA64"))) {
         return TargetOs::Win2003IA64;
+    }
+	// DEC Alpha (ALPHA) and Alpha AXP 64-bit (AXP64): no Windows XP / Server
+    // 2003 media was ever released for these architectures, so they are always
+    // treated strictly as Windows 2000.
+	if (DirExists(PathJoin(iso1Root, L"AXP64"))) {
+        return TargetOs::Win2000;
+    }
+	if (DirExists(PathJoin(iso1Root, L"ALPHA"))) {
+        return TargetOs::Win2000;
     }
     // Determine the main subfolder on the Base ISO (usually I386)
     std::wstring distributionDir = PathJoin(iso1Root, L"I386");
@@ -658,37 +696,42 @@ static bool ReadPeMachineType(const std::wstring& path, WORD& outMachine) {
     return ok;
 }
 
-// Verifies one manually-copied file is a real IA-64 PE image, then re-stamps
-// its checksum (SafeFixCheckSumOne / FixCheckSumOne, same as Step 7 uses for
-// every other binary in the tree) so the header matches the on-disk bytes
-// the operator just placed there.
-static bool TranslateIA64PrepatchedFile(const std::wstring& path) {
+// Verifies one manually-copied file is a genuine PE image for the expected
+// machine type, then re-stamps its checksum (SafeFixCheckSumOne /
+// FixCheckSumOne, same as Step 7 uses for every other binary in the tree) so
+// the header matches the on-disk bytes the operator just placed there.
+static bool TranslatePrepatchedFile(const std::wstring& path,
+                                    const std::wstring& archTag,
+                                    WORD expectedMachine,
+                                    const wchar_t* machineName) {
     if (!FileExists(path)) {
-        LogWarn(L"  [IA-64] %s not found - was it actually copied in?",
-                GetFileNameFromPath(path).c_str());
+        LogWarn(L"  [%s] %s not found - was it actually copied in?",
+                archTag.c_str(), GetFileNameFromPath(path).c_str());
         return false;
     }
 
     WORD machine = 0;
     if (!ReadPeMachineType(path, machine)) {
-        LogWarn(L"  [IA-64] %s does not look like a valid PE image.",
-                GetFileNameFromPath(path).c_str());
+        LogWarn(L"  [%s] %s does not look like a valid PE image.",
+                archTag.c_str(), GetFileNameFromPath(path).c_str());
         return false;
     }
-    if (machine != IMAGE_FILE_MACHINE_IA64) {
-        LogWarn(L"  [IA-64] %s has machine type 0x%04X, expected IA-64 (0x%04X) - "
+    if (machine != expectedMachine) {
+        LogWarn(L"  [%s] %s has machine type 0x%04X, expected %s (0x%04X) - "
                 L"wrong-architecture file may have been copied by mistake.",
-                GetFileNameFromPath(path).c_str(), machine, IMAGE_FILE_MACHINE_IA64);
+                archTag.c_str(), GetFileNameFromPath(path).c_str(),
+                machine, machineName, expectedMachine);
         return false;
     }
 
     bool ok = SafeFixCheckSumOne(path);
     if (ok) {
-        LogInfo(L"  [IA-64] %s verified (IA-64 PE) and checksum re-stamped.",
-                GetFileNameFromPath(path).c_str());
+        LogInfo(L"  [%s] %s verified (%s PE) and checksum re-stamped.",
+                archTag.c_str(), GetFileNameFromPath(path).c_str(), machineName);
     } else {
-        LogWarn(L"  [IA-64] %s is a valid IA-64 PE but its checksum could not be "
-                L"re-stamped; setup may reject it.", GetFileNameFromPath(path).c_str());
+        LogWarn(L"  [%s] %s is a valid %s PE but its checksum could not be "
+                L"re-stamped; setup may reject it.",
+                archTag.c_str(), GetFileNameFromPath(path).c_str(), machineName);
     }
     return ok;
 }
@@ -696,7 +739,8 @@ static bool TranslateIA64PrepatchedFile(const std::wstring& path) {
 // Runs the check above over both files the operator was asked to replace.
 // Called right after the "press Enter to continue" prompt so any mistake is
 // caught immediately instead of surfacing later as a setup failure on real
-// IA-64 hardware.
+// hardware for an architecture that cannot be automatically hex-patched
+// (IA-64, 32-bit DEC Alpha, and 64-bit Alpha AXP).
 //
 // The operator drops the pre-patched files into p.iso1CompBins (ISO_1\comp_bins),
 // i.e. alongside the rest of the Base ISO's staged binaries, rather than
@@ -710,27 +754,30 @@ static bool TranslateIA64PrepatchedFile(const std::wstring& path) {
 // To scope it down to just these two files, they're mirrored into a private
 // temp staging folder, ReplaceResources is run on that folder alone, and the
 // two results are copied over into p.procComp.
-static bool TranslateManualIA64Binaries(const Paths& p) {
+static bool TranslateManualPrepatchedBinaries(const Paths& p,
+                                              const std::wstring& archTag,
+                                              WORD expectedMachine,
+                                              const wchar_t* machineName) {
     std::wstring setupapi = PathJoin(p.iso1CompBins, L"setupapi.dll");
     if (!FileExists(setupapi)) setupapi = PathJoin(p.iso1CompBins, L"SETUPAPI.DLL");
 
     std::wstring syssetup = PathJoin(p.iso1CompBins, L"syssetup.dll");
     if (!FileExists(syssetup)) syssetup = PathJoin(p.iso1CompBins, L"SYSSETUP.DLL");
 
-    LogInfo(L"  [IA-64] Validating manually-copied pre-patched binaries...");
-    bool okSetupapi = TranslateIA64PrepatchedFile(setupapi);
-    bool okSyssetup = TranslateIA64PrepatchedFile(syssetup);
+    LogInfo(L"  [%s] Validating manually-copied pre-patched binaries...", archTag.c_str());
+    bool okSetupapi = TranslatePrepatchedFile(setupapi, archTag, expectedMachine, machineName);
+    bool okSyssetup = TranslatePrepatchedFile(syssetup, archTag, expectedMachine, machineName);
 
     if (!okSetupapi || !okSyssetup) {
-        LogWarn(L"  [IA-64] One or more files failed validation. Re-check the "
-                L"copied binaries before proceeding.");
+        LogWarn(L"  [%s] One or more files failed validation. Re-check the "
+                L"copied binaries before proceeding.", archTag.c_str());
         return false;
     }
 
     // Stage just these two files in an isolated temp folder so
     // ReplaceResources (which processes a whole directory) only ever sees
     // them, not the rest of comp_bins.
-    std::wstring stageDir = PathJoin(p.procRoot, L"ia64_stage_comp");
+    std::wstring stageDir = PathJoin(p.procRoot, archTag + L"_stage_comp");
     MakeDirs(stageDir);
 
     std::wstring stagedSetupapi = PathJoin(stageDir, GetFileNameFromPath(setupapi));
@@ -738,16 +785,17 @@ static bool TranslateManualIA64Binaries(const Paths& p) {
     bool okStage = CopyFileForce(setupapi, stagedSetupapi) &&
                    CopyFileForce(syssetup, stagedSyssetup);
     if (!okStage) {
-        LogWarn(L"  [IA-64] Could not stage setupapi.dll/syssetup.dll for "
-                L"resource replacement.");
+        LogWarn(L"  [%s] Could not stage setupapi.dll/syssetup.dll for "
+                L"resource replacement.", archTag.c_str());
         return false;
     }
 
-    LogInfo(L"  [IA-64] Replacing resources for setupapi.dll / syssetup.dll...");
-    bool okReplace = ReplaceResources(stageDir, p.resources, p.procComp, false);
+    LogInfo(L"  [%s] Replacing resources for setupapi.dll / syssetup.dll...", archTag.c_str());
+    bool okReplace = ReplaceResources(stageDir, p.resources, p.procComp, false, nullptr);
     if (!okReplace) {
-        LogWarn(L"  [IA-64] Resource replacement failed for one or more of the "
-                L"IA-64 binaries; check %s.", p.procComp.c_str());
+        LogWarn(L"  [%s] Resource replacement failed for one or more of the "
+                L"%s binaries; check %s.",
+                archTag.c_str(), machineName, p.procComp.c_str());
     }
     return okReplace;
 }
@@ -759,6 +807,9 @@ static bool TranslateManualIA64Binaries(const Paths& p) {
 void ApplyHexEditsToUncompressed(const Paths& p, int spNum) {
     // Strictly uses p.iso1 (the base installation media layout root)
     TargetOs os = DetectBaseOs(p.iso1);
+
+    Arch arch = Arch::X86;
+    DetectArch(p.iso1, arch);
 
     // Targets to alter reside inside p.procComp
     std::wstring setupapi = PathJoin(p.procComp, L"setupapi.dll");
@@ -772,27 +823,63 @@ void ApplyHexEditsToUncompressed(const Paths& p, int spNum) {
 
     LogInfo(L"\n=== Step: Applying Hex Edits ===");
 
-// Intercept IA-64 architecture here
-    if (os == TargetOs::Win2003IA64) {
-        LogInfo(L"Detected Base OS: Windows XP/Server 2003 (IA-64 Itanium)");
-        LogWarn(L"[!] Automated hex patching is impossible for the IA-64 EPIC instruction set.");
-        
+// Intercept architectures that cannot be automatically hex-patched
+// (IA-64 Itanium, 32-bit DEC Alpha, and 64-bit Alpha AXP). The operator must
+// supply already-patched setupapi.dll/syssetup.dll by hand, which are then
+// validated and resource-replaced like the IA-64 flow.
+// ALPHA / AXP64 media is strictly Windows 2000 (no XP / Server 2003 was ever
+// released for it), so it receives the Windows 2000 x86-like treatment
+// everywhere except here, where the hex patching stays manual.
+    if (arch == Arch::IA64 || arch == Arch::ALPHA || arch == Arch::AXP64) {
+        const wchar_t* osDesc;
+        std::wstring tag;
+        WORD machine;
+        const wchar_t* machineName;
+        const wchar_t* baseOs;
+        if (arch == Arch::IA64) {
+            osDesc = L"IA-64 Itanium";
+            tag    = L"IA-64";
+            machine = IMAGE_FILE_MACHINE_IA64;
+            machineName = L"IA-64";
+            baseOs  = L"Windows Server 2003";
+        } else if (arch == Arch::ALPHA) {
+            osDesc = L"DEC Alpha (32-bit)";
+            tag    = L"ALPHA";
+            machine = IMAGE_FILE_MACHINE_ALPHA;
+            machineName = L"ALPHA";
+            baseOs  = L"Windows 2000";
+        } else {
+            osDesc = L"Alpha AXP (64-bit)";
+            tag    = L"AXP64";
+            machine = IMAGE_FILE_MACHINE_ALPHA64;
+            machineName = L"AXP64";
+            baseOs  = L"Windows 2000";
+        }
+
+        LogInfo(L"Detected Base OS: %s", baseOs);
+        LogWarn(L"[!] Automated hex patching is impossible for the %s instruction set.", machineName);
+
         wprintf(L"\n=================================================================\n");
-        wprintf(L"MANUAL ACTION REQUIRED FOR IA-64 DEPLOYMENT:\n");
-        wprintf(L"Please manually place your pre-patched IA-64 binaries into:\n");
+        wprintf(L"MANUAL ACTION REQUIRED FOR %s DEPLOYMENT:\n", osDesc);
+        wprintf(L"Please manually place your pre-patched %s binaries into:\n", machineName);
         wprintf(L"--> %s\n\n", p.iso1CompBins.c_str());
         wprintf(L"Ensure both 'setupapi.dll' and 'syssetup.dll' are replaced.\n");
         wprintf(L"They will be verified, then have their resources replaced into:\n");
         wprintf(L"--> %s\n", p.procComp.c_str());
         wprintf(L"=================================================================\n\n");
-        
-        Prompt(L"Press [Enter] once you have copied the patched IA-64 files to continue...");
 
-        if (!TranslateManualIA64Binaries(p)) {
-            LogWarn(L"[!] IA-64 setupapi.dll/syssetup.dll processing did not complete "
-                    L"successfully; check the warnings above before shipping this media.");
+        wchar_t promptMsg[512];
+        swprintf_s(promptMsg,
+                   L"Press [Enter] once you have copied the patched %s files to continue...",
+                   machineName);
+        Prompt(promptMsg);
+
+        if (!TranslateManualPrepatchedBinaries(p, tag, machine, machineName)) {
+            LogWarn(L"[!] %s setupapi.dll/syssetup.dll processing did not complete "
+                    L"successfully; check the warnings above before shipping this media.",
+                    machineName);
         }
-        return; 
+        return;
     }
 
     switch (os) {
@@ -856,9 +943,44 @@ void ApplyHexEditsToUncompressed(const Paths& p, int spNum) {
 // Post-Step 10: Help & HTML documentation mirroring
 // ---------------------------------------------------------------------------
 
+// Remap the leading architecture-directory segment of a relative path from the
+// donor tree to the output tree.  For example, when a donor I386 medium is
+// being used to patch an ALPHA base, "I386\SUPPORT\foo.chm" must land in
+// "ALPHA\SUPPORT\foo.chm" - the previous 1:1 mirroring dumped everything into
+// the donor's own arch folder.  Both callers pass same-arch directories too,
+// in which case the segment is returned unchanged.
+static std::wstring RemapArchSegment(const std::wstring& relPath,
+                                     Arch donorArch, Arch outArch) {
+    // Normalize: drop any leading separator (donor root may or may not end in
+    // a backslash, so relPath can start with either "\I386\..." or "I386\...").
+    std::wstring norm = relPath;
+    while (!norm.empty() && (norm[0] == L'\\' || norm[0] == L'/')) norm.erase(0, 1);
+
+    // First component up to the next separator.
+    size_t slash = norm.find_first_of(L"\\/");
+    std::wstring head = (slash == std::wstring::npos) ? norm : norm.substr(0, slash);
+    std::wstring tail = (slash == std::wstring::npos) ? L""  : norm.substr(slash);
+
+    std::wstring headLower = ToLower(head);
+    bool isArchDir =
+        headLower == L"i386"  || headLower == L"amd64" ||
+        headLower == L"ia64"  || headLower == L"axp64" ||
+        headLower == L"alpha";
+    if (!isArchDir) return norm;                  // e.g. SUPPORT, LANG - untouched
+    if (donorArch == outArch) return norm;        // same-arch: keep structure
+
+    // A 64-bit donor's I386 is its WOW folder; if the output is also 64-bit it
+    // has its own I386 WOW folder, so keep it.  Otherwise (incl. a 32-bit
+    // ALPHA base) it folds into the output's native arch directory.
+    if (headLower == L"i386" && IsArch64(donorArch) && IsArch64(outArch)) return norm;
+
+    return std::wstring(ArchDirName(outArch)) + tail;
+}
+
 static void CopyHelpHtmlRecursive(const std::wstring& currentSrcDir, 
                                   const std::wstring& iso2Root, 
                                   const std::wstring& outRoot, 
+                                  Arch donorArch, Arch outArch,
                                   int& count) 
 {
     WIN32_FIND_DATAW fd = {};
@@ -877,7 +999,7 @@ static void CopyHelpHtmlRecursive(const std::wstring& currentSrcDir,
 
         if (fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) {
             // Traverse subdirectories recursively
-            CopyHelpHtmlRecursive(srcPath, iso2Root, outRoot, count);
+            CopyHelpHtmlRecursive(srcPath, iso2Root, outRoot, donorArch, outArch, count);
         } else {
             std::wstring nameLower = ToLower(fd.cFileName);
             
@@ -886,9 +1008,11 @@ static void CopyHelpHtmlRecursive(const std::wstring& currentSrcDir,
                 endsWith(nameLower, L".ch_") || endsWith(nameLower, L".chm") ||
                 endsWith(nameLower, L".hl_") || endsWith(nameLower, L".hlp")) 
             {
-                // Calculate relative path suffix from the resource root folder
+                // Calculate relative path suffix from the resource root folder,
+                // then re-target a leading architecture folder (I386->ALPHA, ...).
                 std::wstring relPath = srcPath.substr(iso2Root.length());
-                std::wstring dstPath = outRoot + relPath;
+                relPath = RemapArchSegment(relPath, donorArch, outArch);
+                std::wstring dstPath = PathJoin(outRoot, relPath);
 
                 // Ensure target subdirectories exist (e.g. out\I386, out\I386\LANG)
                 size_t lastSlash = dstPath.find_last_of(L"\\/");
@@ -909,8 +1033,15 @@ static void CopyHelpHtmlRecursive(const std::wstring& currentSrcDir,
 
 void ApplyHelpHtmlOverwrites(const std::wstring& outRoot, const std::wstring& iso2Root) {
     LogInfo(L"\n=== Post-Step 10: Copy Help & HTML files from Resource ISO ===");
+    Arch donorArch = Arch::X86;
+    Arch outArch   = Arch::X86;
+    if (!DetectArch(iso2Root, donorArch)) donorArch = Arch::X86;
+    if (!DetectArch(outRoot, outArch))    outArch   = Arch::X86;
+    LogInfo(L"  donor media arch: %s, output media arch: %s",
+            ArchDirName(donorArch), ArchDirName(outArch));
+
     int count = 0;
-    CopyHelpHtmlRecursive(iso2Root, iso2Root, outRoot, count);
+    CopyHelpHtmlRecursive(iso2Root, iso2Root, outRoot, donorArch, outArch, count);
     LogInfo(L"  [+] Added/overwrote %d Help/HTML documentation file(s).", count);
 }
 
@@ -920,6 +1051,82 @@ static bool IsPureInteger(const std::wstring& s) {
         if (!std::iswdigit(c)) return false;
     }
     return true;
+}
+
+// Safe mode: files whose base name matches one of the boot-critical kernel /
+// HAL families, the driver/service-pack archives, or a loose compressed
+// driver are copied through untouched (their resources are never replaced).
+// Covers both uncompressed and expanded-compressed name forms.
+static bool IsSafeModeExcludedFile(const std::wstring& fileName) {
+    std::wstring lower = ToLower(fileName);
+    if (StartsWithI(lower, L"ntoskrnl")) return true;   // ntoskrnl.exe
+    if (StartsWithI(lower, L"ntkr"))     return true;   // ntkrnlmp.exe and other ntkr*.exe
+    if (StartsWithI(lower, L"hal"))      return true;   // hal.dll and hal*.dll variants
+
+    if (lower == L"driver.cab")          return true;   // Driver.cab archive
+
+    // Service-pack archives: SP1.CAB, SP2.CAB, ... (no static list; any
+    // "SP"+digits+".CAB" counts).
+    if (lower.size() > 6 &&
+        StartsWithI(lower, L"sp") &&
+        EndsWithI(lower, L".cab")) {
+        bool digitsOnly = true;
+        for (size_t i = 2; i + 4 < lower.size(); ++i) {
+            if (!std::iswdigit(lower[i])) { digitsOnly = false; break; }
+        }
+        if (digitsOnly) return true;
+    }
+
+    // Compressed driver binaries shipped loose on the media.  Drivers stored
+    // inside Driver.cab / SP*.CAB are already covered by the cab exclusions
+    // above (and their contents are never unpacked to loose names in the
+    // safe-mode flow).
+    if (EndsWithI(lower, L".sy_"))       return true;
+    return false;
+}
+
+// Safe mode: after the whole pipeline finishes, re-copy every excluded file
+// from the Base ISO onto the output media, mirroring its relative path and
+// overwriting whatever the pipeline wrote (e.g. a re-compressed .ex_/.sy_).
+// This guarantees the boot-critical kernel/HAL family, Driver.cab / SP*.CAB
+// and loose compressed drivers on the output are byte-identical to the Base
+// ISO originals.
+static void SafeModeRestoreExcludedFiles(const std::wstring& iso1Root,
+                                         const std::wstring& outRoot,
+                                         int& count) {
+    if (!DirExists(iso1Root)) return;
+
+    WIN32_FIND_DATAW fd = {};
+    std::wstring pattern = PathJoin(iso1Root, L"*");
+    HANDLE h = FindFirstFileW(pattern.c_str(), &fd);
+    if (h == INVALID_HANDLE_VALUE) return;
+
+    do {
+        if (wcscmp(fd.cFileName, L".") == 0 || wcscmp(fd.cFileName, L"..") == 0) continue;
+        std::wstring srcPath = PathJoin(iso1Root, fd.cFileName);
+
+        if (fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) {
+            // Recurse into subdirectories, mirroring the same relative path.
+            SafeModeRestoreExcludedFiles(srcPath, PathJoin(outRoot, fd.cFileName), count);
+        } else if (IsSafeModeExcludedFile(fd.cFileName)) {
+            std::wstring dstPath = PathJoin(outRoot, fd.cFileName);
+            // CopyFileForce ensures the target directories exist first.
+            if (CopyFileForce(srcPath, dstPath)) {
+                count++;
+                LogInfo(L"  [+] Safe-mode restore: %s -> %s", fd.cFileName, dstPath.c_str());
+            }
+        }
+    } while (FindNextFileW(h, &fd));
+    FindClose(h);
+}
+
+static void SafeModeRestoreExcludedFiles(const std::wstring& iso1Root,
+                                         const std::wstring& outRoot) {
+    int count = 0;
+    SafeModeRestoreExcludedFiles(iso1Root, outRoot, count);
+    if (count > 0) {
+        LogInfo(L"  Safe-mode restore: %d excluded file(s) copied from Base ISO.", count);
+    }
 }
 
 
@@ -941,8 +1148,8 @@ bool RunPipeline() {
     wprintf(L"\n");
     wprintf(L"  Resource ISO  The donor medium. Its binaries are scanned for\n");
     wprintf(L"                resources (typically string tables, dialogs,\n");
-    wprintf(L"                accelerators, menus) which are then attached to\n");
-    wprintf(L"                or substituted into the Base ISO's binaries.\n");
+    wprintf(L"                accelerators, menus) which are then written into\n");
+    wprintf(L"                the Base ISO's binaries.\n");
     wprintf(L"\n");
     wprintf(L"Both inputs must be local writable directories (mounted ISOs are\n");
     wprintf(L"read-only and will not work). The output folder receives the final\n");
@@ -951,6 +1158,15 @@ bool RunPipeline() {
     wprintf(L"=== Step 1: Inputs ===\n");
     p.iso1 = AskDir(L"Path to BASE ISO     (target media root)   : ", true);
     p.iso2 = AskDir(L"Path to RESOURCE ISO (donor  media root)   : ", true);
+
+    bool baseOptical   = IsOpticalMedia(p.iso1);
+    bool donorOptical  = IsOpticalMedia(p.iso2);
+    if (baseOptical || donorOptical) {
+        wprintf(L"\n  Note: mounted optical (CD/DVD) media detected - Base %s, Resource %s.\n"
+                L"  Files copied from those discs carry the read-only attribute;\n"
+                L"  it will be cleared in the output before the post-cleanup fixups.\n",
+                baseOptical ? L"yes" : L"no", donorOptical ? L"yes" : L"no");
+    }
 
     Arch arch1, arch2;
     if (!DetectArch(p.iso1, arch1)) return false;
@@ -965,9 +1181,9 @@ bool RunPipeline() {
     bool sp1 = HasServicePackCab(p.iso1, spDummy, spNum);
     bool sp2 = HasServicePackCab(p.iso2, spDummy, spNum);
     bool doSp = sp1 || sp2;
-    LogInfo(L"Service pack processing: %s", doSp ? L"ENABLED" : L"skipped (no SP*.CAB found)");
+    LogInfo(L"Service pack detected on media: %s", doSp ? L"yes" : L"no");
 
-    bool doWow = (arch1 == Arch::AMD64 || arch1 == Arch::IA64);
+    bool doWow = IsArch64(arch1);
 
     // ---------------- Step 2 ----------------
     wprintf(L"\n=== Step 2: Output folder ===\n");
@@ -1010,39 +1226,58 @@ bool RunPipeline() {
     else          wprintf(L"  Resource ISO : <unable to detect>\n");
     wprintf(L"\n");
 
-    // Mode prompt: Attach (A) or Replace (R)
-    wprintf(L"Choose how Resource-ISO resources should be applied to the Base:\n");
-    wprintf(L"  A  Attach   - keep extracted lang IDs as-is. The Base binary will\n");
-    wprintf(L"                end up with both its existing language and the new\n");
-    wprintf(L"                one side-by-side, where the OS picks the right one\n");
-    wprintf(L"                via fallback.\n");
-    wprintf(L"  R  Replace  - rename every extracted .bin from lang%lu to lang%lu\n",
-            gotLang2 ? lang2 : 0UL, gotLang1 ? lang1 : 0UL);
-    wprintf(L"                before importing, so the Base's existing entries\n");
-    wprintf(L"                are overwritten with the donor's content.\n");
+    // Mode prompt: Safe (S) or Full (F)
+    wprintf(L"Choose how the Base ISO should be processed:\n");
+    wprintf(L"  S  Safe  - boot-critical files are left untouched: ntoskrnl.exe,\n");
+    wprintf(L"             ntkr*.exe and hal*.dll pass through unchanged, driver.cab\n");
+    wprintf(L"             / SP*.CAB are not processed (the originals are kept),\n");
+    wprintf(L"             and loose *.sy_ driver files are left as-is.\n");
+    wprintf(L"  F  Full  - process everything like usual (every PE binary gets its\n");
+    wprintf(L"             resources replaced and Driver.cab / SP*.CAB rebuilt).\n");
     wprintf(L"\n");
 
-    bool doRename = false;
+    bool safeMode = false;
     while (true) {
-        std::wstring ans = Prompt(L"Mode [A/R]: ");
+        std::wstring ans = Prompt(L"Mode [S/F]: ");
         if (ans.empty()) continue;
         wchar_t c = (wchar_t)::towupper(ans[0]);
-        if (c == L'A') { doRename = false; break; }
-        if (c == L'R') { doRename = true;  break; }
-        wprintf(L"  please enter A or R.\n");
+        if (c == L'S') { safeMode = true;  break; }
+        if (c == L'F') { safeMode = false; break; }
+        wprintf(L"  please enter S or F.\n");
     }
 
-    if (doRename && (!gotLang1 || !gotLang2)) {
-        LogWarn(L"Replace mode selected but a language ID could not be detected;");
-        LogWarn(L"resources will not be renamed (effectively running Attach).");
+    // Attach mode has been retired: resources are always applied in the old
+    // Replace fashion.  The extracted .bin language suffix is renamed from the
+    // donor language to the Base language so the Base's entries are overwritten
+    // with the donor's content (gracefully degraded if a language can't be read
+    // from either medium).
+    bool doRename = true;
+    if (!gotLang1 || !gotLang2) {
+        LogWarn(L"A language ID could not be detected for both ISOs; extracted");
+        LogWarn(L"resources will not be renamed to the Base language.");
         doRename = false;
     }
     if (doRename && lang1 == lang2) {
         LogInfo(L"Both ISOs have the same language; nothing to rename.");
         doRename = false;
     }
-    LogInfo(L"Mode: %s", doRename ? L"REPLACE (rename .bin lang suffix)"
-                                  : L"ATTACH (keep .bin lang suffix as-is)");
+    LogInfo(L"Processing mode: %s", safeMode ? L"SAFE (skip ntoskrnl/ntkr*/hal* + driver.cab + SP*.CAB)"
+                                            : L"FULL (process everything)");
+    LogInfo(L"Resource application: %s",
+            doRename ? L"REPLACE (rename .bin lang suffix to Base)"
+                     : L"REPLACE (no rename possible - keeping suffixes as-is)");
+
+    // Safe mode also disables Driver.cab and SP*.CAB end-to-end so those
+    // archives and their contents reach the output untouched.
+    bool doDriver = !safeMode;
+    if (safeMode) {
+        LogInfo(L"Safe mode: driver.cab processing disabled - original archive kept.");
+        if (doSp) {
+            LogInfo(L"Safe mode: SP*.CAB processing disabled - original archive kept.");
+            doSp = false;
+        }
+        LogInfo(L"Safe mode: kernel/HAL binaries (ntoskrnl, ntkr*, hal*) left untouched.");
+    }
 
     // ---------------- Step 3 ----------------
     wprintf(L"\n=== Step 3: Build staging tree ===\n");
@@ -1054,12 +1289,12 @@ bool RunPipeline() {
     wprintf(L"\n=== Step 4: Populate bins ===\n");
     PopulateFromMedia(p.iso1, arch1,
                       p.iso1CompBins, p.iso1UncompBins,
-                      p.iso1DriverBins,
+                      doDriver ? p.iso1DriverBins : L"",
                       doSp ? p.iso1ServicepackBins : L"",
                       doWow ? p.iso1WowBins : L"");
     PopulateFromMedia(p.iso2, arch2,
                       p.iso2CompBins, p.iso2UncompBins,
-                      p.iso2DriverBins,
+                      doDriver ? p.iso2DriverBins : L"",
                       doSp ? p.iso2ServicepackBins : L"",
                       doWow ? p.iso2WowBins : L"");
 
@@ -1108,9 +1343,9 @@ bool RunPipeline() {
     // Step 4, so they can be fed directly to the extractor.
     ExtractResourcesFromFolder(p.iso2CompBins,        p.resources);
     ExtractResourcesFromFolder(p.iso2UncompBins,      p.resources);
-    ExtractResourcesFromFolder(p.iso2DriverBins,      p.resources);
-    if (doSp)  ExtractResourcesFromFolder(p.iso2ServicepackBins, p.resources);
-    if (doWow) ExtractResourcesFromFolder(p.iso2WowBins, p.resources);
+    if (doDriver) ExtractResourcesFromFolder(p.iso2DriverBins, p.resources);
+    if (doSp)     ExtractResourcesFromFolder(p.iso2ServicepackBins, p.resources);
+    if (doWow)    ExtractResourcesFromFolder(p.iso2WowBins, p.resources);
 
     // Replace mode: rename _lang<src>.bin -> _lang<dst>.bin so they overwrite
     // the Base ISO's existing language slot rather than adding a new one.
@@ -1121,23 +1356,24 @@ bool RunPipeline() {
 
     // ---------------- Step 6 ----------------
     wprintf(L"\n=== Step 6: Replace resources on Base ISO binaries ===\n");
-    ReplaceResources(p.iso1CompBins,        p.resources, p.procComp,        false);
-    ReplaceResources(p.iso1UncompBins,      p.resources, p.procUncomp,      false);
-    ReplaceResources(p.iso1DriverBins,      p.resources, p.procDriver,      false);
-    if (doSp)  ReplaceResources(p.iso1ServicepackBins, p.resources, p.procServicepack, false);
-    if (doWow) ReplaceResources(p.iso1WowBins,         p.resources, p.procWow,         false);
+    ResourceExcludeFn exclude = safeMode ? IsSafeModeExcludedFile : nullptr;
+    ReplaceResources(p.iso1CompBins,        p.resources, p.procComp,        false, exclude);
+    ReplaceResources(p.iso1UncompBins,      p.resources, p.procUncomp,      false, exclude);
+    if (doDriver) ReplaceResources(p.iso1DriverBins,      p.resources, p.procDriver,      false, nullptr);
+    if (doSp)     ReplaceResources(p.iso1ServicepackBins, p.resources, p.procServicepack, false, nullptr);
+    if (doWow)    ReplaceResources(p.iso1WowBins,         p.resources, p.procWow,         false, exclude);
 
     // Make sure patched output is writable for the checksum patch step.
     ClearReadOnlyInDir(p.procComp);
     ClearReadOnlyInDir(p.procUncomp);
-    ClearReadOnlyInDir(p.procDriver);
-    if (doSp)  ClearReadOnlyInDir(p.procServicepack);
-    if (doWow) ClearReadOnlyInDir(p.procWow);
+    if (doDriver) ClearReadOnlyInDir(p.procDriver);
+    if (doSp)     ClearReadOnlyInDir(p.procServicepack);
+    if (doWow)    ClearReadOnlyInDir(p.procWow);
 	// Call the updated orchestrator using p.procComp paths
     ApplyHexEditsToUncompressed(p, spNum);
     // ---------------- Step 7 ----------------
     wprintf(L"\n=== Step 7: Recalculate PE checksums ===\n");
-    FixCheckSumsInTree(p.procRoot);
+    FixCheckSumsInTree(p.procRoot, exclude);
     // ---- Restore w-prefixes on the patched output (so step 8 emits original names)
     if (wStrip) {
         wprintf(L"\n=== Cross-arch: restoring 'w' prefix on patched output ===\n");
@@ -1172,40 +1408,44 @@ bool RunPipeline() {
     CopyTreeForce(p.procUncomp, outArchDir);
 
     // 8c) driver merge + Driver.cab
-    LogInfo(L"  (c) merging driver_bins and rebuilding Driver.cab");
-    CopyTreeNoOverwrite(p.iso1DriverBins, p.procDriver);
+    if (doDriver) {
+        LogInfo(L"  (c) merging driver_bins and rebuilding Driver.cab");
+        CopyTreeNoOverwrite(p.iso1DriverBins, p.procDriver);
 
-    // Windows 2000: driver.cab ships its own copy of KERNEL32.DLL. Before
-    // the CAB is rebuilt, copy+replace the original (unpatched) KERNEL32.DLL
-    // from the Base ISO into driver_bins so the CAB carries the same
-    // untouched binary as the rest of the output (see the VI-b restore in
-    // PostStep10Fixups).
-    if (DetectBaseOs(p.iso1) == TargetOs::Win2000) {
-        const wchar_t* names[] = { L"KERNEL32.DLL", L"kernel32.dll",
-                                   L"KERNEL32.DL_", L"kernel32.dl_" };
-        bool copied = false;
-        for (const wchar_t* sub : { ArchDirName(arch1), L"I386", L"" }) {
-            for (const wchar_t* n : names) {
-                std::wstring cand = (*sub) ? PathJoin(p.iso1, sub, n)
-                                           : PathJoin(p.iso1, n);
-                if (!FileExists(cand)) continue;
-                std::wstring dst = PathJoin(p.procDriver, L"KERNEL32.DLL");
-                if (CopyFileForce(cand, dst)) {
-                    LogInfo(L"  (c)   Win2000: KERNEL32.DLL copied into driver_bins -> %s", dst.c_str());
-                    copied = true;
+        // Windows 2000: driver.cab ships its own copy of KERNEL32.DLL. Before
+        // the CAB is rebuilt, copy+replace the original (unpatched) KERNEL32.DLL
+        // from the Base ISO into driver_bins so the CAB carries the same
+        // untouched binary as the rest of the output (see the VI-b restore in
+        // PostStep10Fixups).
+        if (DetectBaseOs(p.iso1) == TargetOs::Win2000) {
+            const wchar_t* names[] = { L"KERNEL32.DLL", L"kernel32.dll",
+                                       L"KERNEL32.DL_", L"kernel32.dl_" };
+            bool copied = false;
+            for (const wchar_t* sub : { ArchDirName(arch1), L"I386", L"" }) {
+                for (const wchar_t* n : names) {
+                    std::wstring cand = (*sub) ? PathJoin(p.iso1, sub, n)
+                                               : PathJoin(p.iso1, n);
+                    if (!FileExists(cand)) continue;
+                    std::wstring dst = PathJoin(p.procDriver, L"KERNEL32.DLL");
+                    if (CopyFileForce(cand, dst)) {
+                        LogInfo(L"  (c)   Win2000: KERNEL32.DLL copied into driver_bins -> %s", dst.c_str());
+                        copied = true;
+                    }
                 }
+                if (copied) break;
             }
-            if (copied) break;
+            if (!copied) {
+                LogWarn(L"  (c)   Win2000: KERNEL32.DLL/.DL_ not found on Base ISO - "
+                        L"driver_bins may retain a patched copy.");
+            }
         }
-        if (!copied) {
-            LogWarn(L"  (c)   Win2000: KERNEL32.DLL/.DL_ not found on Base ISO - "
-                    L"driver_bins may retain a patched copy.");
-        }
-    }
 
-    {
-        std::wstring drvOut = PathJoin(outArchDir, L"Driver.cab");
-        BuildCab(p.procDriver, drvOut);
+        {
+            std::wstring drvOut = PathJoin(outArchDir, L"Driver.cab");
+            BuildCab(p.procDriver, drvOut);
+        }
+    } else {
+        LogInfo(L"  (c) skipped - original Driver.cab kept on the output media.");
     }
 
     // 8d) servicepack merge + SP*.CAB
@@ -1239,11 +1479,22 @@ bool RunPipeline() {
 
     // ---------------- Post-step-10 output fixups ----------------
     wprintf(L"\n=== Post-step-10: Output folder fixups ===\n");
+    if (baseOptical || donorOptical) {
+        // Files copied from mounted CD/DVD media keep FILE_ATTRIBUTE_READONLY;
+        // PostStep10Fixups edits INF files (hivedef.inf / hivesys.inf) in place
+        // and would otherwise fail with ERROR_ACCESS_DENIED.
+        LogInfo(L"  Clearing read-only attributes on output tree (source was optical media).");
+        ClearReadOnlyTree(p.output);
+    }
     PostStep10Fixups(p.output, p.iso1, p.iso2, arch1, arch2,
                      gotLang1 ? lang1 : 0,
                      gotLang2 ? lang2 : 0,
-                     doRename);
+                     true);  // Attach mode retired: always Replace
 	ApplyHelpHtmlOverwrites(p.output, p.iso2);
+    if (safeMode) {
+        wprintf(L"\n=== Safe mode: restore excluded files from Base ISO ===\n");
+        SafeModeRestoreExcludedFiles(p.iso1, p.output);
+    }
     LogInfo(L"Done. Output is at %s", p.output.c_str());
     return true;
 }
@@ -1668,12 +1919,27 @@ bool FindSection(const std::wstring& text, const std::wstring& name, TargetSecti
 //    the end of the matching section's body in `text` (just before the next
 //    section header, or EOF). If no matching section exists in `text`, the
 //    whole source section (header + body) is appended at EOF.
+//  - A section whose (trimmed, case-insensitive) name appears in `skipSections`
+//    is ignored entirely (used to drop placeholder [WinntDirectories] /
+//    [SourceDisksFiles] blocks from the CJK language fixup files).
 // Returns the number of source sections processed.
 int MergeInfSections(std::wstring& text,
                      const std::vector<RawSection>& srcSections,
-                     const std::wstring& replaceSection) {
+                     const std::wstring& replaceSection,
+                     const std::vector<std::wstring>& skipSections = {}) {
     int n = 0;
     for (const auto& src : srcSections) {
+        bool skip = false;
+        for (const auto& sk : skipSections) {
+            if (_wcsicmp(TrimWS(src.name).c_str(), TrimWS(sk).c_str()) == 0) {
+                skip = true;
+                break;
+            }
+        }
+        if (skip) {
+            LogInfo(L"    skipped placeholder section [%s]", TrimWS(src.name).c_str());
+            continue;
+        }
         bool doReplace = !replaceSection.empty() &&
                          _wcsicmp(TrimWS(src.name).c_str(), TrimWS(replaceSection).c_str()) == 0;
 
@@ -1704,10 +1970,12 @@ int MergeInfSections(std::wstring& text,
 // Merge the [Section]s of the language-fixup file at `srcPath` into the INF
 // file at `dstPath`. The section named `replaceSection` (if non-empty) is
 // replaced wholesale; every other section is appended to its counterpart (or
-// added as a new section). Returns the number of sections merged, 0 if
+// added as a new section). Sections whose names appear in `skipSections` are
+// ignored (see MergeInfSections). Returns the number of sections merged, 0 if
 // `srcPath` had no sections, or -1 on I/O error.
 int MergeInfFile(const std::wstring& dstPath, const std::wstring& srcPath,
-                 const std::wstring& replaceSection) {
+                 const std::wstring& replaceSection,
+                 const std::vector<std::wstring>& skipSections = {}) {
     std::wstring srcText;
     if (!LoadAnyText(srcPath, srcText)) {
         LogWarn(L"  cannot read %s", srcPath.c_str());
@@ -1726,7 +1994,7 @@ int MergeInfFile(const std::wstring& dstPath, const std::wstring& srcPath,
         return -1;
     }
 
-    int n = MergeInfSections(dstText, sections, replaceSection);
+    int n = MergeInfSections(dstText, sections, replaceSection, skipSections);
 
     if (!SaveInfText(dstPath, dstText)) return -1;
     LogInfo(L"  %s: merged %d section(s) from %s",
@@ -1942,6 +2210,139 @@ std::wstring NlsSectionForLang(DWORD langId) {
     }
 }
 
+// ---------------------------------------------------------------------------
+// CJK donor txtsetup.sif merge (Post-step-10, XIII)
+// ---------------------------------------------------------------------------
+//
+// For CJK target languages the donor's txtsetup.sif has the authoritative
+// list of extra source directories ([WinntDirectories]) and extra install
+// files ([SourceDisksFiles]) that a Western base ISO simply does not have.
+// The base's txtsetup.sif is combined with the donor's, and missing donor
+// files are layered into the output arch folder without overwriting existing
+// ones. The hand-authored txtsetup_<NNNN>.txt fixup files reserve
+// [WinntDirectories] / [SourceDisksFiles] as *placeholders* only - their
+// contents are ignored (see the skip list in the Step VII caller), so the
+// real data comes from the actual donor media.
+
+// Collect the body lines (trimmed, terminators stripped) of every [section]
+// whose (trimmed, case-insensitive) name equals `name`, in order.
+// Repeated section headers in INF files are legal - txtsetup.sif for CJK
+// languages has several [WinntDirectories] and [SourceDisksFiles] blocks -
+// so this returns the union of all their lines.
+std::vector<std::wstring> CollectSectionLines(const std::wstring& text,
+                                              const std::wstring& name) {
+    std::vector<std::wstring> out;
+    size_t pos = 0;
+    while (pos < text.size()) {
+        size_t nl = text.find_first_of(L"\r\n", pos);
+        size_t lineEnd = (nl == std::wstring::npos) ? text.size() : nl;
+        size_t termEnd = lineEnd;
+        if (nl != std::wstring::npos) {
+            termEnd = (text[nl] == L'\r' && nl + 1 < text.size() && text[nl + 1] == L'\n')
+                          ? nl + 2 : nl + 1;
+        }
+        std::wstring lineNoTerm = text.substr(pos, lineEnd - pos);
+
+        std::wstring secName;
+        if (IsSectionHeader(lineNoTerm, secName) &&
+            _wcsicmp(TrimWS(secName).c_str(), TrimWS(name).c_str()) == 0) {
+            // Advance to the next section header (or EOF) and harvest the body.
+            size_t bodyStart = termEnd;
+            size_t bodyEnd = text.size();
+            size_t q = termEnd;
+            while (q < text.size()) {
+                size_t qnl = text.find_first_of(L"\r\n", q);
+                size_t qEnd = (qnl == std::wstring::npos) ? text.size() : qnl;
+                std::wstring qLine = text.substr(q, qEnd - q);
+                std::wstring qSec;
+                if (IsSectionHeader(qLine, qSec)) { bodyEnd = q; break; }
+                if (qnl == std::wstring::npos) break;
+                q = (text[qnl] == L'\r' && qnl + 1 < text.size() && text[qnl + 1] == L'\n')
+                        ? qnl + 2 : qnl + 1;
+            }
+            std::wstring body = text.substr(bodyStart, bodyEnd - bodyStart);
+            size_t b = 0;
+            while (b < body.size()) {
+                size_t bnl = body.find_first_of(L"\r\n", b);
+                std::wstring bline = body.substr(b, (bnl == std::wstring::npos) ? body.size() : bnl - b);
+                std::wstring t = TrimWS(bline);
+                if (!t.empty()) out.push_back(t);
+                if (bnl == std::wstring::npos) break;
+                b = (body[bnl] == L'\r' && bnl + 1 < body.size() && body[bnl + 1] == L'\n')
+                        ? bnl + 2 : bnl + 1;
+            }
+            pos = bodyEnd;
+            continue;
+        }
+
+        if (nl == std::wstring::npos) break;
+        pos = termEnd;
+    }
+    return out;
+}
+
+// Given collected CJK donor [SourceDisksFiles] body lines, return the subset
+// that belongs to the *correct* occurrence - the one that declares the CJK NLS
+// codepage table `c_10003.nls` (the marker line `c_10003.nls = 1,,,,,,,2,0,0`).
+// txtsetup.sif for CJK languages has multiple [SourceDisksFiles] blocks; only
+// the one carrying c_10003.nls lists the language-specific files we must add.
+std::vector<std::wstring> CollectCjkSourceDisksLines(const std::wstring& text) {
+    std::vector<std::wstring> out;
+    size_t pos = 0;
+    const std::wstring kMarker = L"c_10003.nls";
+
+    while (pos < text.size()) {
+        size_t nl = text.find_first_of(L"\r\n", pos);
+        size_t lineEnd = (nl == std::wstring::npos) ? text.size() : nl;
+        size_t termEnd = lineEnd;
+        if (nl != std::wstring::npos) {
+            termEnd = (text[nl] == L'\r' && nl + 1 < text.size() && text[nl + 1] == L'\n')
+                          ? nl + 2 : nl + 1;
+        }
+        std::wstring lineNoTerm = text.substr(pos, lineEnd - pos);
+
+        std::wstring secName;
+        size_t bodyStart = termEnd;
+        bool candidate = false;
+        if (IsSectionHeader(lineNoTerm, secName) &&
+            _wcsicmp(TrimWS(secName).c_str(), L"SourceDisksFiles") == 0) {
+            size_t bodyEnd = text.size();
+            size_t q = termEnd;
+            while (q < text.size()) {
+                size_t qnl = text.find_first_of(L"\r\n", q);
+                size_t qEnd = (qnl == std::wstring::npos) ? text.size() : qnl;
+                std::wstring qLine = text.substr(q, qEnd - q);
+                std::wstring qSec;
+                if (IsSectionHeader(qLine, qSec)) { bodyEnd = q; break; }
+                if (qnl == std::wstring::npos) break;
+                q = (text[qnl] == L'\r' && qnl + 1 < text.size() && text[qnl + 1] == L'\n')
+                        ? qnl + 2 : qnl + 1;
+            }
+            std::wstring body = text.substr(bodyStart, bodyEnd - bodyStart);
+            bool isCjk = (StartsWithI(body, kMarker)) || body.find(kMarker) != std::wstring::npos;
+            if (isCjk) {
+                size_t b = 0;
+                while (b < body.size()) {
+                    size_t bnl = body.find_first_of(L"\r\n", b);
+                    std::wstring bline = body.substr(b, (bnl == std::wstring::npos) ? body.size() : bnl - b);
+                    std::wstring t = TrimWS(bline);
+                    if (!t.empty()) out.push_back(t);
+                    if (bnl == std::wstring::npos) break;
+                    b = (body[bnl] == L'\r' && bnl + 1 < body.size() && body[bnl + 1] == L'\n')
+                            ? bnl + 2 : bnl + 1;
+                }
+                return out;
+            }
+            pos = bodyEnd;
+            continue;
+        }
+
+        if (nl == std::wstring::npos) break;
+        pos = termEnd;
+    }
+    return out;
+}
+
 } // anonymous namespace
 
 std::wstring ExtractOemHalFont(const std::wstring& nlsBody) {
@@ -1972,6 +2373,132 @@ std::wstring ExtractOemHalFont(const std::wstring& nlsBody) {
     size_t last = val.find_last_not_of(L" \t");
     
     return val.substr(first, (last - first + 1));
+}
+
+// ---------------------------------------------------------------------------
+// CJK donor media merge (Post-step-10, XIII)
+// ---------------------------------------------------------------------------
+// Splits a section body into its individual lines (terminators stripped).
+static std::vector<std::wstring> SplitBodyLines(const std::wstring& body) {
+    std::vector<std::wstring> out;
+    size_t pos = 0;
+    while (pos < body.size()) {
+        size_t nl = body.find_first_of(L"\r\n", pos);
+        std::wstring line = body.substr(pos, (nl == std::wstring::npos ? body.size() : nl) - pos);
+        out.push_back(line);
+        if (nl == std::wstring::npos) break;
+        pos = (body[nl] == L'\r' && nl + 1 < body.size() && body[nl + 1] == L'\n') ? nl + 2 : nl + 1;
+    }
+    return out;
+}
+
+// Append `newLines` (trimmed, terminators stripped) to the end of the section
+// `secName` inside `text`. Lines whose key (text before '=') already exists in
+// that section are skipped so no duplicate keys are created. If the section is
+// missing it is created at EOF. Returns the number of lines appended.
+static int AppendSectionLinesDedup(std::wstring& text,
+                                   const std::wstring& secName,
+                                   const std::vector<std::wstring>& newLines) {
+    TargetSection ts;
+    bool found = FindSection(text, secName, ts);
+
+    std::set<std::wstring> existingKeys;
+    if (found) {
+        for (const auto& raw : SplitBodyLines(text.substr(ts.headerEnd, ts.bodyEnd - ts.headerEnd))) {
+            std::wstring t = TrimWS(raw);
+            if (t.empty()) continue;
+            size_t eq = t.find(L'=');
+            std::wstring key = (eq == std::wstring::npos) ? t : TrimWS(t.substr(0, eq));
+            existingKeys.insert(ToLower(key));
+        }
+    }
+
+    std::wstring append;
+    int appended = 0;
+    for (const auto& raw : newLines) {
+        std::wstring t = TrimWS(raw);
+        if (t.empty()) continue;
+        size_t eq = t.find(L'=');
+        std::wstring key = (eq == std::wstring::npos) ? t : TrimWS(t.substr(0, eq));
+        if (existingKeys.count(ToLower(key))) continue;
+        existingKeys.insert(ToLower(key));
+        append += t + L"\r\n";
+        appended++;
+    }
+    if (appended == 0 || append.empty()) return 0;
+
+    if (found) {
+        text = text.substr(0, ts.bodyEnd) + append + text.substr(ts.bodyEnd);
+    } else {
+        if (!text.empty() && text.back() != L'\n' && text.back() != L'\r') text += L"\r\n";
+        text += L"[" + secName + L"]\r\n" + append;
+    }
+    return appended;
+}
+
+// (XIII) CJK donor media merge:
+//   1) combine every [WinntDirectories] section of the donor txtsetup.sif and
+//      append the non-duplicate lines to the output txtsetup.sif,
+//   2) locate the correct [SourceDisksFiles] occurrence (the one declaring the
+//      CJK NLS table `c_10003.nls`) and append its lines to the output, and
+//   3) copy files from donor\<donor_arch> into output\<base_arch> without
+//      overwriting existing files.
+// The [WinntDirectories] / [SourceDisksFiles] blocks inside the hand-authored
+// txtsetup_<NNNN>.txt fixup files are placeholders and are skipped earlier
+// (see the skip list in the Step VII caller); the real data comes from here.
+static void MergeCjkDonorSections(const std::wstring& outRoot,
+                                  const std::wstring& iso2Root,
+                                  const wchar_t* baseArchDir,
+                                  const wchar_t* donorArchDir) {
+    std::wstring donorSif = FindOutputFile(iso2Root, donorArchDir, L"txtsetup.sif");
+    if (donorSif.empty()) donorSif = FindOutputFile(iso2Root, donorArchDir, L"TXTSETUP.SIF");
+    std::wstring outSif = FindOutputFile(outRoot, baseArchDir, L"txtsetup.sif");
+    if (outSif.empty()) outSif = FindOutputFile(outRoot, baseArchDir, L"TXTSETUP.SIF");
+
+    if (donorSif.empty() || outSif.empty()) {
+        LogWarn(L"  (XIII) donor/output txtsetup.sif not found (donor=%s output=%s) - CJK merge skipped.",
+                donorSif.c_str(), outSif.c_str());
+        return;
+    }
+
+    std::wstring donorText;
+    if (!LoadInfText(donorSif, donorText)) {
+        LogWarn(L"  (XIII) cannot read donor %s", donorSif.c_str());
+        return;
+    }
+    std::wstring outText;
+    if (!LoadInfText(outSif, outText)) {
+        LogWarn(L"  (XIII) cannot read output %s", outSif.c_str());
+        return;
+    }
+
+    // (1) [WinntDirectories] - combine ALL donor occurrences into the output.
+    auto wdLines = CollectSectionLines(donorText, L"WinntDirectories");
+    int nWd = 0;
+    if (!wdLines.empty()) nWd = AppendSectionLinesDedup(outText, L"WinntDirectories", wdLines);
+    LogInfo(L"  (XIII) [WinntDirectories]: %d new line(s) merged from donor.", nWd);
+
+    // (2) the correct [SourceDisksFiles] (the block declaring c_10003.nls).
+    auto sdfLines = CollectCjkSourceDisksLines(donorText);
+    int nSdf = 0;
+    if (!sdfLines.empty()) nSdf = AppendSectionLinesDedup(outText, L"SourceDisksFiles", sdfLines);
+    LogInfo(L"  (XIII) [SourceDisksFiles]: %d new line(s) merged from donor.", nSdf);
+
+    if (nWd + nSdf > 0) {
+        if (!SaveInfText(outSif, outText))
+            LogWarn(L"  (XIII) cannot write output %s", outSif.c_str());
+    }
+
+    // (3) copy donor arch files into the output base arch (no overwrite).
+    std::wstring donorArchAbs = PathJoin(iso2Root, donorArchDir);
+    std::wstring outArchAbs   = PathJoin(outRoot, baseArchDir);
+    if (DirExists(donorArchAbs)) {
+        LogInfo(L"  (XIII) copying missing files from %s -> %s (no overwrite).",
+                donorArchAbs.c_str(), outArchAbs.c_str());
+        CopyTreeNoOverwrite(donorArchAbs, outArchAbs);
+    } else {
+        LogWarn(L"  (XIII) donor arch folder %s not found - file copy skipped.", donorArchAbs.c_str());
+    }
 }
 
 static bool PostStep10Fixups(const std::wstring& outRoot,
@@ -2031,7 +2558,7 @@ static bool PostStep10Fixups(const std::wstring& outRoot,
         if (intlInf.empty()) LogWarn(L"  (III) intl.inf not found");
         else                 EditInfFile(intlInf, L"Locale", newHex8, L"DefaultValues");
     } else {
-        LogInfo(L"  (III) skipped (Attach mode or no donor lang).");
+        LogInfo(L"  (III) skipped (no donor lang detected).");
     }
 
     // (IV) hivesys.inf  INSTALL_LANGUAGE="0409" -> new (no leading zeros)
@@ -2235,7 +2762,8 @@ static bool PostStep10Fixups(const std::wstring& outRoot,
                     if (dstFile.empty()) {
                         LogWarn(L"  (VII) txtsetup.sif not found under %s", outRoot.c_str());
                     } else {
-                        MergeInfFile(dstFile, srcFile, L"nls");
+                        MergeInfFile(dstFile, srcFile, L"nls",
+                                     {L"WinntDirectories", L"SourceDisksFiles"});
                     }
                 }
             }
@@ -2278,30 +2806,16 @@ static bool PostStep10Fixups(const std::wstring& outRoot,
                 }
             }
 
-            // (X) Copy every file from <Resource ISO (donor)>\<donor-arch> to
-            //     <output>\<arch>, without overwriting anything already
-            //     produced by the pipeline.
-            //
-            // The destination subfolder is always the *Base*'s arch dir
-            // (archDir, e.g. I386 for x86 output, AMD64 for x64 output) -
-            // that's the layout of the output media. The source subfolder is
-            // the donor's own arch dir, since that's where the donor's files
-            // actually live on its media:
-            //
-            //   Base x86 + Donor x86 -> Output\I386   (from donor I386)
-            //   Base x64 + Donor x64 -> Output\AMD64  (from donor AMD64)
-            //   Base x64 + Donor x86 -> Output\AMD64  (from donor I386)
+            // (XIII) CJK donor media merge: combine the donor txtsetup.sif's
+            //   [WinntDirectories] / [SourceDisksFiles] sections into the
+            //   output and copy missing donor arch files (no overwrite).
+            //   Only meaningful for CJK languages where the Western base ISO
+            //   lacks the language-specific directory and file listings.
             {
                 const wchar_t* donorArchDir = ArchDirName(donorArch);
-                std::wstring srcDir = PathJoin(iso2Root, donorArchDir);
-                std::wstring dstDir = archAbs;
-                if (!DirExists(srcDir)) {
-                    LogWarn(L"  (X)   %s not found on Resource (donor) ISO", srcDir.c_str());
-                } else {
-                    LogInfo(L"  (X)   copying %s -> %s (no overwrite)", srcDir.c_str(), dstDir.c_str());
-                    CopyTreeNoOverwrite(srcDir, dstDir);
-                }
+                MergeCjkDonorSections(outRoot, iso2Root, archDir, donorArchDir);
             }
+
         }
 
         // (XI) txtsetup.sif: replace the driver-media descriptor fragment
@@ -2419,7 +2933,7 @@ static bool PostStep10Fixups(const std::wstring& outRoot,
             }
         }
     } else {
-        LogInfo(L"  (VII-XII) skipped (Attach mode or no donor lang).");
+        LogInfo(L"  (VII-XII) skipped (no donor lang detected).");
     }
 
     return true;

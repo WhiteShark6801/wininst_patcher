@@ -149,6 +149,7 @@ void WalkAndProcess(const std::wstring& inputFolder,
                     const std::wstring& resourceFolder,
                     const std::wstring& outputFolder,
                     bool skipEmpty,
+                    ResourceExcludeFn isExcluded,
                     int& totalProcessed,
                     int& totalUpdated) {
     WIN32_FIND_DATAW fd = {};
@@ -163,7 +164,7 @@ void WalkAndProcess(const std::wstring& inputFolder,
             // recurse, mirroring the structure under outputFolder
             WalkAndProcess(full, resourceFolder,
                            PathJoin(outputFolder, fd.cFileName),
-                           skipEmpty, totalProcessed, totalUpdated);
+                           skipEmpty, isExcluded, totalProcessed, totalUpdated);
             continue;
         }
         if (!IsPEFile(full)) continue;
@@ -171,6 +172,12 @@ void WalkAndProcess(const std::wstring& inputFolder,
         totalProcessed++;
         std::wstring outPath = PathJoin(outputFolder, fd.cFileName);
         if (!CopyFileForce(full, outPath)) continue;
+
+        // Safe mode: excluded boot-critical files pass through unmodified.
+        if (isExcluded && isExcluded(fd.cFileName)) {
+            LogDebug(L"  excluded (left untouched): %s", fd.cFileName);
+            continue;
+        }
 
         int rc = UpdateOne(outPath, resourceFolder);
         if (rc > 0) {
@@ -207,7 +214,8 @@ bool IsPEFile(const std::wstring& filepath) {
 bool ReplaceResources(const std::wstring& inputFolder,
                       const std::wstring& resourceFolder,
                       const std::wstring& outputFolder,
-                      bool skipEmpty) {
+                      bool skipEmpty,
+                      ResourceExcludeFn isExcluded) {
     LogInfo(L"Starting resource replacement...");
     LogInfo(L"  in:  %s", inputFolder.c_str());
     LogInfo(L"  res: %s", resourceFolder.c_str());
@@ -224,7 +232,7 @@ bool ReplaceResources(const std::wstring& inputFolder,
 
     int processed = 0, updated = 0;
     WalkAndProcess(inputFolder, resourceFolder, outputFolder, skipEmpty,
-                   processed, updated);
+                   isExcluded, processed, updated);
 
     LogInfo(L"Resource replacement done: %d processed, %d updated.", processed, updated);
     return true;
