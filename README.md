@@ -196,6 +196,7 @@ This tree is ready for import into **nLite** or other ISO repackaging tools.
 - Patterns vary by OS version (Win2000, WinXP, Win2003, Win2003x64)
 - IA64, DEC Alpha (ALPHA), and Alpha AXP 64-bit (AXP64): Requires manual pre-patched binaries (EPIC/RISC instruction sets are not amenable to automated patching)
 - ALPHA / AXP64 media is treated strictly as Windows 2000 (no XP/Server 2003 exists for it), including the Win2000 KERNEL32/DSSBASE/RSABASE handling — the hex-patching step alone stays manual like IA64
+- ALPHA / AXP64 support is **work in progress** and may not work fully; treat these architectures as experimental.
 
 **Step 8: PE Checksum Re-stamping**
 - Walks entire output tree recursively
@@ -277,7 +278,7 @@ This mix works because x64 Edition shares core binaries with Server 2003 but WOW
 
 ### Q: How do I patch DEC Alpha (ALPHA) or Alpha AXP 64-bit (AXP64) media?
 
-**A:** These architectures are treated strictly as Windows 2000 (no XP/Server 2003 releases exist for them), receiving the Windows 2000 x86-like handling (Win2000 hex-patch baseline, unpatched KERNEL32/DSSBASE/RSABASE restoration). The hex-patching step itself works like IA64:
+**A:** **Warning: ALPHA / AXP64 support is work in progress and may not work fully.** These architectures are treated strictly as Windows 2000 (no XP/Server 2003 releases exist for them), receiving the Windows 2000 x86-like handling (Win2000 hex-patch baseline, unpatched KERNEL32/DSSBASE/RSABASE restoration). The hex-patching step itself works like IA64:
 1. Obtain pre-patched `setupapi.dll` and `syssetup.dll` for your Alpha/AXP build
 2. Place them in the tool's input directory
 3. When prompted, copy them to the indicated staging folder
