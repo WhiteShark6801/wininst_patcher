@@ -4,6 +4,7 @@
 #include <cwchar>
 #include <cstdarg>
 #include <algorithm>
+#include <set>
 #include <shlwapi.h>
 #include <shellapi.h>   // SHFileOperationW, SHFILEOPSTRUCTW, FO_DELETE, FOF_*
 
@@ -235,7 +236,8 @@ bool CopyFileNoOverwrite(const std::wstring& src, const std::wstring& dst) {
     return true;
 }
 
-static bool CopyTreeImpl(const std::wstring& src, const std::wstring& dst, bool overwrite) {
+static bool CopyTreeImpl(const std::wstring& src, const std::wstring& dst, bool overwrite,
+                         const std::set<std::wstring>* exclDirNames = nullptr) {
     if (!DirExists(src)) {
         LogError(L"CopyTree: source not a directory: %s", src.c_str());
         return false;
@@ -255,7 +257,13 @@ static bool CopyTreeImpl(const std::wstring& src, const std::wstring& dst, bool 
         std::wstring d = PathJoin(dst, fd.cFileName);
 
         if (fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) {
-            if (!CopyTreeImpl(s, d, overwrite)) ok = false;
+            // Excluded folders are not descended into and not created at the
+            // destination - the whole subtree is skipped.
+            if (exclDirNames && exclDirNames->count(ToLower(fd.cFileName))) {
+                LogInfo(L"CopyTree: skipping excluded folder %s", s.c_str());
+                continue;
+            }
+            if (!CopyTreeImpl(s, d, overwrite, exclDirNames)) ok = false;
         } else {
             bool r = overwrite ? CopyFileForce(s, d) : CopyFileNoOverwrite(s, d);
             if (!r) ok = false;
@@ -267,6 +275,76 @@ static bool CopyTreeImpl(const std::wstring& src, const std::wstring& dst, bool 
 
 bool CopyTreeForce      (const std::wstring& src, const std::wstring& dst) { return CopyTreeImpl(src, dst, true);  }
 bool CopyTreeNoOverwrite(const std::wstring& src, const std::wstring& dst) { return CopyTreeImpl(src, dst, false); }
+
+bool CopyTreeNoOverwriteExcluding(const std::wstring& src, const std::wstring& dst,
+                                  const std::vector<std::wstring>& exclDirNames) {
+    std::set<std::wstring> excl;
+    for (const std::wstring& n : exclDirNames) excl.insert(ToLower(n));
+    return CopyTreeImpl(src, dst, false, &excl);
+}
+
+static bool MatchesAnyExt(const std::wstring& fileName,
+                          const std::vector<std::wstring>& extsLower) {
+    if (extsLower.empty()) return true;   // no filter: match everything
+    std::wstring lower = ToLower(fileName);
+    for (const std::wstring& e : extsLower) {
+        // size() > e.size() so a file literally named ".inf" is not matched.
+        if (lower.size() > e.size() &&
+            lower.compare(lower.size() - e.size(), e.size(), e) == 0)
+            return true;
+    }
+    return false;
+}
+
+static bool CopyTreeByExtImpl(const std::wstring& src, const std::wstring& dst,
+                              const std::vector<std::wstring>& extsLower,
+                              bool overwrite, int& copied) {
+    if (!DirExists(src)) {
+        LogError(L"CopyTreeByExt: source not a directory: %s", src.c_str());
+        return false;
+    }
+    if (!MakeDirs(dst)) return false;
+
+    WIN32_FIND_DATAW fd = {};
+    std::wstring pattern = PathJoin(src, L"*");
+    HANDLE h = FindFirstFileW(pattern.c_str(), &fd);
+    if (h == INVALID_HANDLE_VALUE) return true;   // empty source dir
+
+    bool ok = true;
+    do {
+        if (wcscmp(fd.cFileName, L".") == 0 || wcscmp(fd.cFileName, L"..") == 0) continue;
+
+        std::wstring s = PathJoin(src, fd.cFileName);
+        std::wstring d = PathJoin(dst, fd.cFileName);
+
+        if (fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) {
+            if (!CopyTreeByExtImpl(s, d, extsLower, overwrite, copied)) ok = false;
+            continue;
+        }
+        if (!MatchesAnyExt(fd.cFileName, extsLower)) continue;
+
+        bool r;
+        if (overwrite) {
+            r = CopyFileForce(s, d);
+        } else {
+            if (FileExists(d)) continue;      // present already - not counted
+            r = CopyFileNoOverwrite(s, d);
+        }
+        if (!r) ok = false; else ++copied;
+    } while (FindNextFileW(h, &fd));
+    FindClose(h);
+    return ok;
+}
+
+bool CopyTreeByExt(const std::wstring& src, const std::wstring& dst,
+                   const std::vector<std::wstring>& exts,
+                   bool overwrite, int& copiedOut) {
+    copiedOut = 0;
+    std::vector<std::wstring> extsLower;
+    extsLower.reserve(exts.size());
+    for (const std::wstring& e : exts) extsLower.push_back(ToLower(e));
+    return CopyTreeByExtImpl(src, dst, extsLower, overwrite, copiedOut);
+}
 
 void ClearReadOnlyInDir(const std::wstring& dir) {
     if (!DirExists(dir)) return;

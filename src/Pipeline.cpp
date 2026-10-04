@@ -419,6 +419,31 @@ static bool BuildStagingTree(const Paths& p) {
 // Pipeline driver
 // ---------------------------------------------------------------------------
 
+// An output folder must be drive-qualified ("C:\folder") or UNC
+// ("\\server\share"). This rejects malformed specs such as "7C:\folder":
+// the prefix before the colon has to be exactly one letter, otherwise
+// CreateDirectoryW fails with ERROR_INVALID_NAME (123). It also rejects bare
+// relative paths, which CreateDirectoryW would resolve against whatever the
+// current working directory happens to be.
+static bool IsFullyQualified(const std::wstring& s) {
+    if (s.size() >= 3 && iswalpha(s[0]) && s[1] == L':' &&
+        (s[2] == L'\\' || s[2] == L'/')) return true;
+    if (s.size() >= 2 && s[0] == L'\\' && s[1] == L'\\') return true;
+    return false;
+}
+
+// Canonicalize an already-validated output path so that "..", short names and
+// redundant separators cannot make later comparisons or the final "Done"
+// message disagree with what was actually written. Keeps a bare "C:\".
+static std::wstring NormalizeOutputDir(const std::wstring& in) {
+    wchar_t full[32768];
+    DWORD n = GetFullPathNameW(in.c_str(), _countof(full), full, nullptr);
+    if (n == 0 || n >= _countof(full)) return L"";
+    std::wstring s(full, n);
+    while (s.size() > 3 && (s.back() == L'\\' || s.back() == L'/')) s.pop_back();
+    return s;
+}
+
 static std::wstring AskDir(const wchar_t* prompt, bool mustExist) {
     while (true) {
         std::wstring s = Prompt(prompt);
@@ -614,14 +639,22 @@ void AddFontToSourceDisksFiles(const std::wstring& txtsetupPath, const std::wstr
 
 static void ApplyPatchesToFile(const std::wstring& path, const std::vector<HexEditDef>& edits) {
     if (!FileExists(path)) {
+        LogWarn(L"    [!] Patch target missing, skipping: %s", path.c_str());
         return;
     }
 
     for (const auto& edit : edits) {
         int hits = HexPatchFile(path, HexBytes(edit.from), HexBytes(edit.to));
         if (hits > 0) {
-            LogInfo(L"    [+] Patched %d instance(s) in %s: %s -> %s", 
+            LogInfo(L"    [+] Patched %d instance(s) in %s: %s -> %s",
                     hits, GetFileNameFromPath(path).c_str(), edit.from, edit.to);
+        } else {
+            // Previously silent. A zero-hit pattern almost always means the
+            // wrong binary variant was selected (e.g. RTM patterns against an
+            // SP2+ file), so it must not pass unnoticed.
+            LogWarn(L"    [!] No match for %s -> %s in %s. The binary does not have the "
+                    L"expected layout - check the detected Base OS / service-pack level.",
+                    edit.from, edit.to, GetFileNameFromPath(path).c_str());
         }
     }
 }
@@ -804,7 +837,10 @@ static bool TranslateManualPrepatchedBinaries(const Paths& p,
 // Main Hex Editing Orchestrator
 // ---------------------------------------------------------------------------
 
-void ApplyHexEditsToUncompressed(const Paths& p, int spNum) {
+// `baseSpNum` is the Base media's service-pack level (0 = RTM). It must come
+// from the Base and never from the donor: the patterns below are matched
+// against Base binaries, and each generation has its own prologue layout.
+void ApplyHexEditsToUncompressed(const Paths& p, int baseSpNum) {
     // Strictly uses p.iso1 (the base installation media layout root)
     TargetOs os = DetectBaseOs(p.iso1);
 
@@ -894,8 +930,9 @@ void ApplyHexEditsToUncompressed(const Paths& p, int spNum) {
             break;
 
         case TargetOs::WinXP:
-            LogInfo(L"Detected Base OS: Windows XP (SP%d)", spNum);
-            if (spNum < 2) {
+            LogInfo(L"Detected Base OS: Windows XP (SP%d%s)", baseSpNum,
+                    baseSpNum == 0 ? L" / RTM" : L"");
+            if (baseSpNum < 2) {
                 ApplyPatchesToFile(setupapi, { {L"558BEC8B452C", L"33C0C230002C"} });
                 ApplyPatchesToFile(syssetup, {
                     {L"8B44240833D2",   L"31C0C2080090"},
@@ -911,8 +948,9 @@ void ApplyHexEditsToUncompressed(const Paths& p, int spNum) {
             break;
 
         case TargetOs::Win2003:
-            LogInfo(L"Detected Base OS: Windows Server 2003 (SP%d)", spNum);
-            if (spNum == 0) {
+            LogInfo(L"Detected Base OS: Windows Server 2003 (SP%d%s)", baseSpNum,
+                    baseSpNum == 0 ? L" / RTM" : L"");
+            if (baseSpNum == 0) {
                 ApplyPatchesToFile(setupapi, { {L"8BFF558BEC8B452C", L"33C0C230008B452C"} });
                 ApplyPatchesToFile(syssetup, {
                     {L"DB395D088945FC0F", L"DB85DB908945FC0F"},
@@ -1130,7 +1168,102 @@ static void SafeModeRestoreExcludedFiles(const std::wstring& iso1Root,
 }
 
 
-bool RunPipeline() {
+// ---------------------------------------------------------------------------
+// Post-build-only mode (-p / --postbuild-only)
+//
+// Re-applies the finishing stages to an output tree that already exists, so a
+// run that died late (broken CAB build, bad output path discovered at step 8,
+// manual cancellation) can be completed without repeating extraction and
+// resource replacement - by far the slowest part of the pipeline.
+// Steps 1 and 2 still run: the Base/Resource ISO roots are the reference the
+// fixups resolve against. Steps 3-10 are skipped, which means the output is
+// assumed to already hold the patched binaries and archives.
+// ---------------------------------------------------------------------------
+
+// Probe a directory for write access by creating (and immediately deleting) a
+// scratch file. A directory that exists but cannot be written to - read-only
+// ACL, a stale optical mount, a path owned by another user - would otherwise
+// fail much later, one INF file at a time.
+static bool DirWritable(const std::wstring& dir) {
+    wchar_t probe[MAX_PATH];
+    int n = _snwprintf_s(probe, _countof(probe), _TRUNCATE,
+                        L"%s\\.__wininst_wtest_%lu.tmp",
+                        dir.c_str(), (unsigned long)GetCurrentProcessId());
+    if (n < 0) {
+        LogError(L"Output path is too long: %s", dir.c_str());
+        return false;
+    }
+    HANDLE h = CreateFileW(probe, GENERIC_WRITE, 0, nullptr, CREATE_ALWAYS,
+                           FILE_ATTRIBUTE_TEMPORARY | FILE_FLAG_DELETE_ON_CLOSE, nullptr);
+    if (h == INVALID_HANDLE_VALUE) {
+        LogError(L"Output folder is not writable (%lu): %s", GetLastError(), dir.c_str());
+        return false;
+    }
+    CloseHandle(h);
+    return true;
+}
+
+// Media text/config files whose content has to match the Base ISO byte for
+// byte. A run that failed before step 9 leaves these missing from the output,
+// and the post-step-10 fixups then edit (or fail to find) the wrong copies, so
+// refresh them from the Base ISO before any fixup runs.
+static const wchar_t* kPostBuildTextExts[] = {
+    L".inf", L".in_", L".ca_", L".cat", L".sif"
+};
+
+static bool PostBuildRestoreMediaText(const Paths& p) {
+    std::vector<std::wstring> exts(std::begin(kPostBuildTextExts),
+                                   std::end(kPostBuildTextExts));
+    LogInfo(L"  Refreshing Base media text files (*.inf, *.in_, *.ca_, *.cat, *.sif):");
+    LogInfo(L"    %s  ->  %s", p.iso1.c_str(), p.output.c_str());
+
+    int copied = 0;
+    if (!CopyTreeByExt(p.iso1, p.output, exts, /*overwrite=*/true, copied)) {
+        LogError(L"  Failed to refresh Base media text files - see errors above.");
+        return false;
+    }
+    LogInfo(L"  Refreshed %d file(s) from the Base ISO.", copied);
+    return true;
+}
+
+static bool RunPostBuildOnly(Paths& p, Arch arch1, Arch arch2,
+                             DWORD lang1, DWORD lang2,
+                             bool gotLang1, bool gotLang2) {
+    wprintf(L"\n=== Post-build-only mode ===\n");
+    wprintf(L"Steps 3-10 are skipped: the output tree is treated as already\n");
+    wprintf(L"containing the patched binaries. Only the finishing stages run.\n");
+    wprintf(L"\n=== Steps 3-10: SKIPPED (post-build-only) ===\n");
+
+    // The fixups rewrite INF/SIF files in place, which fails with
+    // ERROR_ACCESS_DENIED while the read-only attribute is still set. Clear it
+    // unconditionally here: the output is user-supplied here, so it may have
+    // come off optical media regardless of what the inputs look like.
+    LogInfo(L"Clearing read-only attributes on the output tree.");
+    ClearReadOnlyTree(p.output);
+    if (!DirWritable(p.output)) {
+        wprintf(L"  [FATAL] Output folder is not writable. Aborting.\n");
+        return false;
+    }
+
+    wprintf(L"\n=== Pre-post-step-10: restore Base media text files ===\n");
+    if (!PostBuildRestoreMediaText(p)) return false;
+
+    wprintf(L"\n=== Post-step-10: Output folder fixups ===\n");
+    if (!PostStep10Fixups(p.output, p.iso1, p.iso2, arch1, arch2,
+                          gotLang1 ? lang1 : 0,
+                          gotLang2 ? lang2 : 0,
+                          true)) {   // Attach mode retired: always Replace
+        LogError(L"Post-step-10 fixups failed.");
+        wprintf(L"\n=== FAILED: post-step-10 fixups did not complete - see the log ===\n");
+        return false;
+    }
+    ApplyHelpHtmlOverwrites(p.output, p.iso2);
+
+    LogInfo(L"Done. Output is at %s", p.output.c_str());
+    return true;
+}
+
+bool RunPipeline(bool postBuildOnly) {
     Paths p;
 
     // ---------------- Step 1 ----------------
@@ -1177,18 +1310,84 @@ bool RunPipeline() {
     }
     LogInfo(L"Detected architecture: %s", ArchDirName(arch1));
 
-    std::wstring spDummy; int spNum = 0;
-    bool sp1 = HasServicePackCab(p.iso1, spDummy, spNum);
-    bool sp2 = HasServicePackCab(p.iso2, spDummy, spNum);
-    bool doSp = sp1 || sp2;
-    LogInfo(L"Service pack detected on media: %s", doSp ? L"yes" : L"no");
+    // The Base and the donor service-pack levels must be tracked separately.
+    // They used to share one `spNum`, which only worked when the donor had no
+    // SP of its own: HasServicePackCab leaves the out-param untouched on a miss,
+    // so an RTM Base followed by an SP donor ended up with the *donor's* level.
+    // Hex patching then selected the SP2+/SP3 binary patterns for RTM Base
+    // binaries, none of which matched, so no patch was applied at all.
+    //   - `baseSpNum` describes the binaries being patched (Base media) and is
+    //     what the hex-patch variant selection must use.
+    //   - `donorHasSp` only drives whether SP*.CAB handling runs at all.
+    std::wstring baseSpCab, donorSpCab;
+    int baseSpNum = 0, donorSpNum = 0;
+    bool baseHasSp  = HasServicePackCab(p.iso1, baseSpCab,  baseSpNum);
+    bool donorHasSp = HasServicePackCab(p.iso2, donorSpCab, donorSpNum);
+    bool doSp = baseHasSp || donorHasSp;
+
+    if (baseHasSp) LogInfo(L"Service pack on Base media:     SP%d", baseSpNum);
+    else          LogInfo(L"Service pack on Base media:     none (RTM)");
+    if (donorHasSp) LogInfo(L"Service pack on Resource media: SP%d", donorSpNum);
+    else            LogInfo(L"Service pack on Resource media: none (RTM)");
+    LogInfo(L"Service pack processing enabled: %s", doSp ? L"yes" : L"no");
+    if (baseHasSp && donorHasSp && baseSpNum != donorSpNum) {
+        LogWarn(L"Base is SP%d but the donor is SP%d - hex patches are selected from the "
+                L"Base level (SP%d). Confirm the output boots correctly.",
+                baseSpNum, donorSpNum, baseSpNum);
+    }
 
     bool doWow = IsArch64(arch1);
 
     // ---------------- Step 2 ----------------
     wprintf(L"\n=== Step 2: Output folder ===\n");
-    p.output = AskDir(L"Path to output folder (must be empty): ", false);
-    MakeDirs(p.output);
+    if (postBuildOnly) {
+        // The output already holds a media tree, so it must exist and be
+        // writable. Nothing is created here - creating it would only mask the
+        // mistake of pointing at the wrong path.
+        wprintf(L"Point this at the existing, partially built output media.\n");
+        wprintf(L"It must already exist and be writable (typically the output\n");
+        wprintf(L"folder of a previous run that failed).\n");
+        p.output = AskDir(L"Path to existing output folder: ", true);
+        std::wstring norm = NormalizeOutputDir(p.output);
+        if (norm.empty()) {
+            LogError(L"Cannot resolve output folder: %s", p.output.c_str());
+            wprintf(L"  [FATAL] Output folder could not be resolved. Aborting.\n");
+            return false;
+        }
+        p.output = norm;
+        if (!DirWritable(p.output)) {
+            wprintf(L"  [FATAL] Output folder is not writable. Aborting.\n");
+            return false;
+        }
+    } else {
+    while (true) {
+        std::wstring raw = Prompt(L"Path to output folder (must be empty): ");
+        if (raw.empty()) {
+            wprintf(L"  empty, please try again.\n");
+            continue;
+        }
+        if (!IsFullyQualified(raw)) {
+            wprintf(L"  not a valid absolute path: %s\n", raw.c_str());
+            wprintf(L"  expected C:\\folder (or \\\\server\\share). Note the drive\n"
+                    L"  letter must be a single letter - \"7C:\\folder\" is invalid.\n");
+            continue;
+        }
+        p.output = NormalizeOutputDir(raw);
+        if (p.output.empty()) {
+            wprintf(L"  cannot resolve path: %s\n", raw.c_str());
+            continue;
+        }
+        break;
+    }
+    // Fail fast before any expensive staging work. FindFirstFileW below
+    // reports a nonexistent folder as INVALID_HANDLE_VALUE, the same value it
+    // uses for an empty one, so the emptiness check cannot be trusted to
+    // notice that the destination was never created.
+    if (!MakeDirs(p.output) || !DirExists(p.output)) {
+        LogError(L"Cannot create output folder: %s", p.output.c_str());
+        wprintf(L"  [FATAL] Output folder could not be created. Aborting.\n");
+        return false;
+    }
     {
         // Empty check
         WIN32_FIND_DATAW fd; std::wstring pat = PathJoin(p.output, L"*");
@@ -1210,8 +1409,14 @@ bool RunPipeline() {
             }
         }
     }
-    p.root = PathJoin(GetExeDir(), L"_work");
-    FillPaths(p);
+    }   // end of !postBuildOnly output-folder block
+
+    if (!postBuildOnly) {
+        // Steps 3-10 work out of a staging tree next to the executable.
+        // Post-build-only mode never touches it.
+        p.root = PathJoin(GetExeDir(), L"_work");
+        FillPaths(p);
+    }
 
     // ---------------- Pre-Step 3: language detection + mode ----------------
     wprintf(L"\n=== Detect ISO languages (hivedef.inf / INTL_LOCALE) ===\n");
@@ -1225,6 +1430,14 @@ bool RunPipeline() {
     if (gotLang2) wprintf(L"  Resource ISO : 0x%04X (%lu) - %s\n", lang2, lang2, LangIdName(lang2));
     else          wprintf(L"  Resource ISO : <unable to detect>\n");
     wprintf(L"\n");
+
+    // Post-build-only: the fixups are the whole job, and they only need the two
+    // ISO roots (resolved above), the output tree, and the detected languages.
+    // Mode is not asked for because nothing gets processed - there is no CAB to
+    // rebuild and no binary to skip.
+    if (postBuildOnly) {
+        return RunPostBuildOnly(p, arch1, arch2, lang1, lang2, gotLang1, gotLang2);
+    }
 
     // Mode prompt: Safe (S) or Full (F)
     wprintf(L"Choose how the Base ISO should be processed:\n");
@@ -1370,7 +1583,7 @@ bool RunPipeline() {
     if (doSp)     ClearReadOnlyInDir(p.procServicepack);
     if (doWow)    ClearReadOnlyInDir(p.procWow);
 	// Call the updated orchestrator using p.procComp paths
-    ApplyHexEditsToUncompressed(p, spNum);
+    ApplyHexEditsToUncompressed(p, baseSpNum);
     // ---------------- Step 7 ----------------
     wprintf(L"\n=== Step 7: Recalculate PE checksums ===\n");
     FixCheckSumsInTree(p.procRoot, exclude);
@@ -1393,24 +1606,28 @@ bool RunPipeline() {
 
     // ---------------- Step 8 ----------------
     wprintf(L"\n=== Step 8: Build output ===\n");
+    // Steps 8-9 do all the writing. Collect failures instead of discarding the
+    // returns: every helper below already logs its own error, so without this
+    // a completely empty output tree still ended in "Done." and exit code 0.
+    bool buildOk = true;
     std::wstring outArchDir = PathJoin(p.output, ArchDirName(arch1));
-    MakeDirs(outArchDir);
+    if (!MakeDirs(outArchDir)) buildOk = false;
     // For IA64/AMD64 the WOW (32-bit) files go into <output>\I386
     std::wstring outI386Dir = PathJoin(p.output, L"I386");
-    if (doWow) MakeDirs(outI386Dir);
+    if (doWow && !MakeDirs(outI386Dir)) buildOk = false;
 
     // 8a) compress proc_comp -> outArchDir
     LogInfo(L"  (a) compressing comp_bins -> %s", outArchDir.c_str());
-    CompressFolderPerFile(p.procComp, outArchDir);
+    if (!CompressFolderPerFile(p.procComp, outArchDir)) buildOk = false;
 
     // 8b) copy proc_uncomp -> outArchDir
     LogInfo(L"  (b) copying uncomp_bins -> %s", outArchDir.c_str());
-    CopyTreeForce(p.procUncomp, outArchDir);
+    if (!CopyTreeForce(p.procUncomp, outArchDir)) buildOk = false;
 
     // 8c) driver merge + Driver.cab
     if (doDriver) {
         LogInfo(L"  (c) merging driver_bins and rebuilding Driver.cab");
-        CopyTreeNoOverwrite(p.iso1DriverBins, p.procDriver);
+        if (!CopyTreeNoOverwrite(p.iso1DriverBins, p.procDriver)) buildOk = false;
 
         // Windows 2000: driver.cab ships its own copy of KERNEL32.DLL. Before
         // the CAB is rebuilt, copy+replace the original (unpatched) KERNEL32.DLL
@@ -1442,7 +1659,10 @@ bool RunPipeline() {
 
         {
             std::wstring drvOut = PathJoin(outArchDir, L"Driver.cab");
-            BuildCab(p.procDriver, drvOut);
+            if (!BuildCab(p.procDriver, drvOut)) {
+                LogError(L"  (c) Driver.cab was NOT built: %s", drvOut.c_str());
+                buildOk = false;
+            }
         }
     } else {
         LogInfo(L"  (c) skipped - original Driver.cab kept on the output media.");
@@ -1451,13 +1671,16 @@ bool RunPipeline() {
     // 8d) servicepack merge + SP*.CAB
     if (doSp) {
         LogInfo(L"  (d) merging servicepack_bins and rebuilding SP*.CAB");
-        CopyTreeNoOverwrite(p.iso1ServicepackBins, p.procServicepack);
+        if (!CopyTreeNoOverwrite(p.iso1ServicepackBins, p.procServicepack)) buildOk = false;
         // figure out the SP number to use as the filename
         std::wstring spCab; int n = 0;
         if (HasServicePackCab(p.iso1, spCab, n) || HasServicePackCab(p.iso2, spCab, n)) {
             std::wstring spOut = PathJoin(outArchDir,
                                           L"SP" + std::to_wstring(n) + L".CAB");
-            BuildCab(p.procServicepack, spOut);
+            if (!BuildCab(p.procServicepack, spOut)) {
+                LogError(L"  (d) %s was NOT built.", spOut.c_str());
+                buildOk = false;
+            }
         } else {
             LogWarn(L"  Could not determine SP number; skipping CAB build.");
         }
@@ -1466,12 +1689,12 @@ bool RunPipeline() {
     // 8e) compress proc_wow -> I386 (only on 64-bit)
     if (doWow) {
         LogInfo(L"  (e) compressing wow_bins -> %s", outI386Dir.c_str());
-        CompressFolderPerFile(p.procWow, outI386Dir);
+        if (!CompressFolderPerFile(p.procWow, outI386Dir)) buildOk = false;
     }
 
     // ---------------- Step 9 ----------------
     wprintf(L"\n=== Step 9: Copy remainder of ISO_1 ===\n");
-    CopyTreeNoOverwrite(p.iso1, p.output);
+    if (!CopyTreeNoOverwrite(p.iso1, p.output)) buildOk = false;
 
     // ---------------- Step 10 ----------------
     wprintf(L"\n=== Step 10: Cleanup ===\n");
@@ -1486,14 +1709,20 @@ bool RunPipeline() {
         LogInfo(L"  Clearing read-only attributes on output tree (source was optical media).");
         ClearReadOnlyTree(p.output);
     }
-    PostStep10Fixups(p.output, p.iso1, p.iso2, arch1, arch2,
+PostStep10Fixups(p.output, p.iso1, p.iso2, arch1, arch2,
                      gotLang1 ? lang1 : 0,
                      gotLang2 ? lang2 : 0,
                      true);  // Attach mode retired: always Replace
-	ApplyHelpHtmlOverwrites(p.output, p.iso2);
+ 	ApplyHelpHtmlOverwrites(p.output, p.iso2);
     if (safeMode) {
         wprintf(L"\n=== Safe mode: restore excluded files from Base ISO ===\n");
         SafeModeRestoreExcludedFiles(p.iso1, p.output);
+    }
+    if (!buildOk) {
+        LogError(L"FAILED: one or more output steps failed. Output at %s is INCOMPLETE.",
+                 p.output.c_str());
+        wprintf(L"\n=== FAILED: output is incomplete - see the log for details ===\n");
+        return false;
     }
     LogInfo(L"Done. Output is at %s", p.output.c_str());
     return true;
@@ -1577,11 +1806,16 @@ static void RestoreWPrefixes(const std::vector<WRename>& log) {
 
 namespace {
 
-// Read entire file as text, decoding as UTF-8 (no BOM handling - files
-// written by this tool are always plain UTF-8 without a BOM; if a source
-// INF happens to use the system ANSI codepage instead, the UTF-8 decode
-// will simply fail and we fall back to ANSI for that read only).
-bool LoadInfText(const std::wstring& path, std::wstring& text) {
+// Detected/text encoding used when reading or writing a text file.
+enum class InfEnc { Utf8, Ansi, Utf16LE, Utf16BE };
+
+// Read entire file as text. INF files on NT5.x installation media are almost
+// always UTF-16LE (BOM FF FE), so that encoding is detected first. Files
+// written by this tool are plain UTF-8 without a BOM; if a source INF happens
+// to use the system ANSI codepage instead, the UTF-8 decode will simply fail
+// and we fall back to ANSI for that read only. On success the detected
+// encoding is stored in *outEnc so callers can save in the same encoding.
+bool LoadInfText(const std::wstring& path, std::wstring& text, InfEnc* outEnc = nullptr) {
     HANDLE h = CreateFileW(path.c_str(), GENERIC_READ, FILE_SHARE_READ, nullptr,
                            OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
     if (h == INVALID_HANDLE_VALUE) return false;
@@ -1593,11 +1827,40 @@ bool LoadInfText(const std::wstring& path, std::wstring& text) {
     CloseHandle(h);
     if (!ok) return false;
 
+    InfEnc enc = InfEnc::Utf8;
+    if (raw.size() >= 2) {
+        const unsigned char* p = (const unsigned char*)raw.data();
+        if (p[0] == 0xFF && p[1] == 0xFE) {
+            // UTF-16LE with BOM. On Windows wchar_t is 2 bytes, so a direct
+            // cast of the payload is valid.
+            size_t units = (raw.size() - 2) / 2;
+            const wchar_t* src = (const wchar_t*)(raw.data() + 2);
+            text.assign(src, units);
+            if (outEnc) *outEnc = InfEnc::Utf16LE;
+            return true;
+        }
+        if (p[0] == 0xFE && p[1] == 0xFF) {
+            // UTF-16BE with BOM - byte-swap into a buffer.
+            size_t units = (raw.size() - 2) / 2;
+            std::wstring tmp;
+            tmp.resize(units);
+            for (size_t i = 0; i < units; i++) {
+                unsigned char lo = p[2 + i * 2];
+                unsigned char hi = p[3 + i * 2];
+                tmp[i] = (wchar_t)(((wchar_t)lo) | (((wchar_t)hi) << 8));
+            }
+            text = std::move(tmp);
+            if (outEnc) *outEnc = InfEnc::Utf16BE;
+            return true;
+        }
+    }
+
     if (!raw.empty()) {
         int n = MultiByteToWideChar(CP_UTF8, MB_ERR_INVALID_CHARS, raw.data(), (int)raw.size(), nullptr, 0);
         if (n > 0) {
             text.resize(n);
             MultiByteToWideChar(CP_UTF8, 0, raw.data(), (int)raw.size(), &text[0], n);
+            if (outEnc) *outEnc = InfEnc::Utf8;
             return true;
         }
     }
@@ -1605,23 +1868,57 @@ bool LoadInfText(const std::wstring& path, std::wstring& text) {
     int n = MultiByteToWideChar(CP_ACP, 0, raw.data(), (int)raw.size(), nullptr, 0);
     text.resize(n);
     if (n > 0) MultiByteToWideChar(CP_ACP, 0, raw.data(), (int)raw.size(), &text[0], n);
+    if (outEnc) *outEnc = InfEnc::Ansi;
     return true;
 }
 
-// Write `text` as plain UTF-8, no BOM.
-bool SaveInfText(const std::wstring& path, const std::wstring& text) {
+// Write `text` back to `path`, re-encoding to the same format `path` was
+// loaded with (the original INF files on NT5.x media are UTF-16LE with BOM,
+// so round-tripping preserves that; files created fresh by this tool are
+// UTF-8 without a BOM).
+bool SaveInfText(const std::wstring& path, const std::wstring& text, InfEnc enc = InfEnc::Utf8) {
     HANDLE h = CreateFileW(path.c_str(), GENERIC_WRITE, 0, nullptr,
                            CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
     if (h == INVALID_HANDLE_VALUE) {
         LogWarn(L"  cannot write %s (%lu)", path.c_str(), GetLastError());
         return false;
     }
+    std::string narrow;
+    if (enc == InfEnc::Utf16LE) {
+        // Write a UTF-16LE BOM then the payload.
+        for (unsigned char b : { (unsigned char)0xFF, (unsigned char)0xFE })
+            narrow.push_back((char)b);
+        size_t units = text.size();
+        narrow.reserve(2 + units * 2);
+        for (size_t i = 0; i < units; i++) {
+            wchar_t c = text[i];
+            narrow.push_back((char)(c & 0xFF));
+            narrow.push_back((char)((c >> 8) & 0xFF));
+        }
+    } else if (enc == InfEnc::Utf16BE) {
+        for (unsigned char b : { (unsigned char)0xFE, (unsigned char)0xFF })
+            narrow.push_back((char)b);
+        size_t units = text.size();
+        narrow.reserve(2 + units * 2);
+        for (size_t i = 0; i < units; i++) {
+            wchar_t c = text[i];
+            narrow.push_back((char)((c >> 8) & 0xFF));
+            narrow.push_back((char)(c & 0xFF));
+        }
+    } else if (enc == InfEnc::Ansi) {
+        int need = WideCharToMultiByte(CP_ACP, 0, text.data(), (int)text.size(),
+                                       nullptr, 0, nullptr, nullptr);
+        narrow.resize(need);
+        WideCharToMultiByte(CP_ACP, 0, text.data(), (int)text.size(),
+                            &narrow[0], need, nullptr, nullptr);
+    } else {
+        int need = WideCharToMultiByte(CP_UTF8, 0, text.data(), (int)text.size(),
+                                       nullptr, 0, nullptr, nullptr);
+        narrow.resize(need);
+        WideCharToMultiByte(CP_UTF8, 0, text.data(), (int)text.size(),
+                            &narrow[0], need, nullptr, nullptr);
+    }
     DWORD wrote = 0;
-    int need = WideCharToMultiByte(CP_UTF8, 0, text.data(), (int)text.size(),
-                                   nullptr, 0, nullptr, nullptr);
-    std::string narrow(need, '\0');
-    WideCharToMultiByte(CP_UTF8, 0, text.data(), (int)text.size(),
-                        &narrow[0], need, nullptr, nullptr);
     WriteFile(h, narrow.data(), (DWORD)narrow.size(), &wrote, nullptr);
     CloseHandle(h);
     return true;
@@ -1731,7 +2028,8 @@ int EditInfFile(const std::wstring& path,
                 const std::wstring& sectionFilter)
 {
     std::wstring text;
-    if (!LoadInfText(path, text)) {
+    InfEnc enc = InfEnc::Utf8;
+    if (!LoadInfText(path, text, &enc)) {
         LogWarn(L"  cannot read %s", path.c_str());
         return 0;
     }
@@ -1747,7 +2045,7 @@ int EditInfFile(const std::wstring& path,
         }
         return 0;
     }
-    if (!SaveInfText(path, text)) return 0;
+    if (!SaveInfText(path, text, enc)) return 0;
     LogInfo(L"  %s: %d edit(s) for '%s' -> %s",
             GetFileNameFromPath(path).c_str(), n, key.c_str(), newQuoted.c_str());
     return n;
@@ -1989,14 +2287,15 @@ int MergeInfFile(const std::wstring& dstPath, const std::wstring& srcPath,
     }
 
     std::wstring dstText;
-    if (!LoadInfText(dstPath, dstText)) {
+    InfEnc dstEnc = InfEnc::Utf8;
+    if (!LoadInfText(dstPath, dstText, &dstEnc)) {
         LogWarn(L"  cannot read %s", dstPath.c_str());
         return -1;
     }
 
     int n = MergeInfSections(dstText, sections, replaceSection, skipSections);
 
-    if (!SaveInfText(dstPath, dstText)) return -1;
+    if (!SaveInfText(dstPath, dstText, dstEnc)) return -1;
     LogInfo(L"  %s: merged %d section(s) from %s",
             GetFileNameFromPath(dstPath).c_str(), n, GetFileNameFromPath(srcPath).c_str());
     return n;
@@ -2011,14 +2310,15 @@ int MergeInfTextFromString(const std::wstring& dstPath, const std::wstring& srcT
     if (sections.empty()) return 0;
 
     std::wstring dstText;
-    if (!LoadInfText(dstPath, dstText)) {
+    InfEnc dstEnc = InfEnc::Utf8;
+    if (!LoadInfText(dstPath, dstText, &dstEnc)) {
         LogWarn(L"  cannot read %s", dstPath.c_str());
         return -1;
     }
 
     int n = MergeInfSections(dstText, sections, replaceSection);
 
-    if (!SaveInfText(dstPath, dstText)) return -1;
+    if (!SaveInfText(dstPath, dstText, dstEnc)) return -1;
     LogInfo(L"  %s: merged %d section(s)", GetFileNameFromPath(dstPath).c_str(), n);
     return n;
 }
@@ -2436,6 +2736,129 @@ static int AppendSectionLinesDedup(std::wstring& text,
     return appended;
 }
 
+// ---------------------------------------------------------------------------
+// (XIV) RTM Base + service-pack-integrated donor (CJK targets)
+//
+// A CJK donor that ships with an integrated service pack describes its files
+// with media IDs that only exist on the donor's own, larger medium. Step XIII
+// merges those donor [SourceDisksFiles] lines into the output txtsetup.sif, so
+// the output ends up pointing at disks the RTM Base media does not have. GUI
+// mode setup then cannot resolve the NLS / font / IME files and fails.
+//
+// The fix is to renumber the donor-derived IDs down to IDs that do exist on the
+// RTM Base layout. Which IDs are involved depends on the media generation, so
+// the table is keyed off the detected Base OS.
+//
+// The same RTM-Base/SP-donor combination means the donor also carries an ASMS
+// folder belonging to that service pack. It must not reach the output: left in
+// place, GUI mode setup attempts to service it and fails. The folder is skipped
+// during the (XIII) donor copy rather than deleted afterwards.
+// ---------------------------------------------------------------------------
+
+struct MediaIdRemap {
+    const wchar_t* from;   // literal fragment as it appears on the donor media
+    const wchar_t* to;     // replacement that exists on the RTM Base layout
+};
+
+// Media-ID fragments to renumber, per Base media generation. Empty = unknown
+// generation, nothing is touched.
+static const std::vector<MediaIdRemap>& RtmDonorMediaIdRemaps(TargetOs os) {
+    static const std::vector<MediaIdRemap> kWin2000 = {
+        { L"2,,",   L"1,,"  },
+    };
+    static const std::vector<MediaIdRemap> kXp2003 = {
+        { L"100,,", L"1,,"  },
+        { L"107,,", L"7,,"  },
+    };
+    // AMD64 media carries both the native 64-bit IDs (155/156) and the x86
+    // emulation IDs (100/107) in the same txtsetup.sif / layout.inf, so the
+    // XP/2003 pair is applied here as well. The four fragments share no prefix
+    // with one another, so the order they are applied in is irrelevant.
+    static const std::vector<MediaIdRemap> kXp2003Amd64 = {
+        { L"155,,", L"55,," },
+        { L"156,,", L"56,," },
+        { L"100,,", L"1,,"  },
+        { L"107,,", L"7,,"  },
+    };
+    // IA64 media: the donor ID scheme is not documented, so nothing is
+    // renumbered rather than guessing. The call site logs this.
+    static const std::vector<MediaIdRemap> kNone = {};
+
+    switch (os) {
+        case TargetOs::Win2000:     return kWin2000;
+        case TargetOs::WinXP:       return kXp2003;
+        case TargetOs::Win2003:     return kXp2003;
+        case TargetOs::Win2003x64:  return kXp2003Amd64;
+        case TargetOs::Win2003IA64: return kNone;
+    }
+    return kNone;
+}
+
+// True when the Base media is RTM while the donor carries an integrated
+// service pack - the combination that produces the dangling media IDs above
+// and the ASMS folder.
+static bool RtmBaseWithSpDonor(const std::wstring& iso1Root, const std::wstring& iso2Root) {
+    std::wstring cab; int n = 0;
+    if (HasServicePackCab(iso1Root, cab, n)) return false;   // Base is not RTM
+    return HasServicePackCab(iso2Root, cab, n);              // donor has an SP
+}
+
+// Renumber donor-derived media IDs in txtsetup.sif and layout.inf. Returns the
+// total number of fragments replaced across both files. `tag` is only used for
+// log prefixes.
+static int FixRtmCjkMediaIds(const std::wstring& outRoot, const wchar_t* archDir,
+                             TargetOs os, const wchar_t* tag) {
+    const std::vector<MediaIdRemap>& remaps = RtmDonorMediaIdRemaps(os);
+    if (remaps.empty()) {
+        LogWarn(L"  %s  no known media-ID map for this Base architecture - "
+                L"txtsetup.sif / layout.inf left unchanged. Verify manually.", tag);
+        return 0;
+    }
+
+    int total = 0;
+    const wchar_t* names[] = { L"txtsetup.sif", L"layout.inf" };
+    for (const wchar_t* name : names) {
+        std::wstring path = FindOutputFile(outRoot, archDir, name);
+        if (path.empty()) {
+            LogInfo(L"  %s  %s not found under %s - nothing to renumber.",
+                    tag, name, outRoot.c_str());
+            continue;
+        }
+        std::wstring text;
+        InfEnc enc = InfEnc::Utf8;
+        if (!LoadInfText(path, text, &enc)) {
+            LogWarn(L"  %s  could not read %s", tag, path.c_str());
+            continue;
+        }
+
+        int replaced = 0;
+        for (const MediaIdRemap& r : remaps) {
+            std::wstring from(r.from);
+            std::wstring to(r.to);
+            size_t pos = 0;
+            while ((pos = text.find(from, pos)) != std::wstring::npos) {
+                text.replace(pos, from.size(), to);
+                pos += to.size();
+                replaced++;
+            }
+        }
+
+        if (replaced == 0) {
+            LogInfo(L"  %s  %s: no dangling media IDs found (already consistent, or "
+                    L"this layout does not use them).", tag, name);
+            continue;
+        }
+        if (!SaveInfText(path, text, enc)) {
+            LogWarn(L"  %s  could not write %s", tag, path.c_str());
+            continue;
+        }
+        LogInfo(L"  %s  %s: renumbered %d media ID fragment(s).",
+                tag, name, replaced);
+        total += replaced;
+    }
+    return total;
+}
+
 // (XIII) CJK donor media merge:
 //   1) combine every [WinntDirectories] section of the donor txtsetup.sif and
 //      append the non-duplicate lines to the output txtsetup.sif,
@@ -2449,7 +2872,8 @@ static int AppendSectionLinesDedup(std::wstring& text,
 static void MergeCjkDonorSections(const std::wstring& outRoot,
                                   const std::wstring& iso2Root,
                                   const wchar_t* baseArchDir,
-                                  const wchar_t* donorArchDir) {
+                                  const wchar_t* donorArchDir,
+                                  bool excludeAsmsDirs) {
     std::wstring donorSif = FindOutputFile(iso2Root, donorArchDir, L"txtsetup.sif");
     if (donorSif.empty()) donorSif = FindOutputFile(iso2Root, donorArchDir, L"TXTSETUP.SIF");
     std::wstring outSif = FindOutputFile(outRoot, baseArchDir, L"txtsetup.sif");
@@ -2467,7 +2891,8 @@ static void MergeCjkDonorSections(const std::wstring& outRoot,
         return;
     }
     std::wstring outText;
-    if (!LoadInfText(outSif, outText)) {
+    InfEnc outEnc = InfEnc::Utf8;
+    if (!LoadInfText(outSif, outText, &outEnc)) {
         LogWarn(L"  (XIII) cannot read output %s", outSif.c_str());
         return;
     }
@@ -2485,7 +2910,7 @@ static void MergeCjkDonorSections(const std::wstring& outRoot,
     LogInfo(L"  (XIII) [SourceDisksFiles]: %d new line(s) merged from donor.", nSdf);
 
     if (nWd + nSdf > 0) {
-        if (!SaveInfText(outSif, outText))
+        if (!SaveInfText(outSif, outText, outEnc))
             LogWarn(L"  (XIII) cannot write output %s", outSif.c_str());
     }
 
@@ -2495,7 +2920,19 @@ static void MergeCjkDonorSections(const std::wstring& outRoot,
     if (DirExists(donorArchAbs)) {
         LogInfo(L"  (XIII) copying missing files from %s -> %s (no overwrite).",
                 donorArchAbs.c_str(), outArchAbs.c_str());
-        CopyTreeNoOverwrite(donorArchAbs, outArchAbs);
+        bool copied = false;
+        if (excludeAsmsDirs) {
+            // The donor's ASMS folder belongs to its integrated service pack.
+            // Once it reaches the output, GUI mode setup tries to service it and
+            // fails, so the folder and everything under it are left behind.
+            LogInfo(L"  (XIII) RTM Base + SP-integrated donor: skipping the ASMS folder.");
+            const std::vector<std::wstring> excl{ L"ASMS" };
+            copied = CopyTreeNoOverwriteExcluding(donorArchAbs, outArchAbs, excl);
+        } else {
+            copied = CopyTreeNoOverwrite(donorArchAbs, outArchAbs);
+        }
+        if (!copied)
+            LogWarn(L"  (XIII) donor arch copy reported errors - see above.");
     } else {
         LogWarn(L"  (XIII) donor arch folder %s not found - file copy skipped.", donorArchAbs.c_str());
     }
@@ -2510,6 +2947,22 @@ static bool PostStep10Fixups(const std::wstring& outRoot,
     (void)baseLang;  // only used implicitly via Replace mode logic
     const wchar_t* archDir = ArchDirName(arch);
     std::wstring archAbs = PathJoin(outRoot, archDir);
+
+    // (0) Cross-CJK warning: if the BASE media is a CJK language but the
+    // DONOR (target language) is a Western one (English, Turkish, German,
+    // etc.), the output keeps the CJK-specific spddlang.sys font-metadata
+    // file. Point this out, since replacing it with the Western version from
+    // the donor ISO is recommended to avoid text-mode font/metadata issues.
+    if (replaceMode && newLang != 0) {
+        bool baseCjk  = !CjkLangTag(baseLang).empty();
+        bool donorCjk = !CjkLangTag(newLang).empty();
+        if (baseCjk && !donorCjk) {
+            LogWarn(L"  (0)   Base ISO is a CJK language (%s) but the donor/target is Western (%s). "
+                    L"It is recommended to replace spddlang.sys in the output with the Western "
+                    L"one from a Western ISO (e.g. the donor media)",
+                    LangIdName(baseLang), LangIdName(newLang));
+        }
+    }
 
     // (I) ntdll.dll -> system32\ntdll.dll
     {
@@ -2813,7 +3266,27 @@ static bool PostStep10Fixups(const std::wstring& outRoot,
             //   lacks the language-specific directory and file listings.
             {
                 const wchar_t* donorArchDir = ArchDirName(donorArch);
-                MergeCjkDonorSections(outRoot, iso2Root, archDir, donorArchDir);
+
+                // (XIV) Detect the RTM-Base + SP-integrated-donor combination up
+                //   front: it decides both the ASMS skip below and the media-ID
+                //   renumbering that has to run *after* the merge, because the
+                //   merge is what injects the dangling donor IDs.
+                bool rtmBaseSpDonor = RtmBaseWithSpDonor(iso1Root, iso2Root);
+                if (rtmBaseSpDonor) {
+                    LogInfo(L"  (XIV) RTM Base + service-pack-integrated donor detected.");
+                    if (DirExists(PathJoin(iso2Root, L"ASMS")) ||
+                        DirExists(PathJoin(iso2Root, donorArchDir, L"ASMS"))) {
+                        LogInfo(L"  (XIV) donor has an ASMS folder - keeping it out of the output.");
+                    }
+                }
+
+                MergeCjkDonorSections(outRoot, iso2Root, archDir, donorArchDir,
+                                      rtmBaseSpDonor);
+
+                if (rtmBaseSpDonor) {
+                    TargetOs baseOs = DetectBaseOs(iso1Root);
+                    FixRtmCjkMediaIds(outRoot, archDir, baseOs, L"(XIV)");
+                }
             }
 
         }
@@ -2830,7 +3303,8 @@ static bool PostStep10Fixups(const std::wstring& outRoot,
                 LogWarn(L"  (XI)  txtsetup.sif not found under %s", outRoot.c_str());
             } else {
                 std::wstring text;
-                if (!LoadInfText(sifPath, text)) {
+                InfEnc enc = InfEnc::Utf8;
+                if (!LoadInfText(sifPath, text, &enc)) {
                     LogWarn(L"  (XI)  could not read %s", sifPath.c_str());
                 } else {
                     const std::wstring kOld = L" 1,,,,,,3_,2,1,,,1,2";
@@ -2846,7 +3320,7 @@ static bool PostStep10Fixups(const std::wstring& outRoot,
                         LogWarn(L"  (XI)  pattern not found in %s - may already be patched or layout differs",
                                 GetFileNameFromPath(sifPath).c_str());
                     } else {
-                        if (!SaveInfText(sifPath, text)) {
+                        if (!SaveInfText(sifPath, text, enc)) {
                             LogWarn(L"  (XI)  could not write %s", sifPath.c_str());
                         } else {
                             LogInfo(L"  (XI)  %s: replaced %d occurrence(s) of media descriptor",
