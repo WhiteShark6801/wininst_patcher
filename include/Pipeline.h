@@ -38,8 +38,13 @@ bool DetectArch(const std::wstring& mediaRoot, Arch& outArch);
 bool HasServicePackCab(const std::wstring& mediaRoot,
                        std::wstring& outCabFile, int& outSpNum);
 
-// Run the full pipeline. Returns true on success.
-bool RunPipeline();
+// Run the pipeline. Returns true on success.
+// With postBuildOnly set, Steps 1-2 still run (both ISO roots and an existing,
+// writable output folder are prompted for) but Steps 3-10 are skipped and only
+// the finishing stages are applied to that output tree - see -p /
+// --postbuild-only. Intended for finishing a run that failed late without
+// repeating extraction and resource replacement.
+bool RunPipeline(bool postBuildOnly = false);
 
 // Re-stamp the PE checksum on every PE file in dir (recursive).  If
 // isExcluded is non-null, matching files are skipped (left byte-for-byte

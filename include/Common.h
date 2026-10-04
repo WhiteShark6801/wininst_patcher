@@ -76,6 +76,23 @@ bool CopyFileForce      (const std::wstring& src, const std::wstring& dst);
 bool CopyTreeNoOverwrite(const std::wstring& src, const std::wstring& dst);
 bool CopyTreeForce      (const std::wstring& src, const std::wstring& dst);
 
+// Like CopyTreeNoOverwrite, but any subdirectory whose name matches one of
+// `exclDirNames` (case-insensitive) is skipped entirely - not descended into
+// and not created at the destination. Used to keep media folders that break
+// GUI-mode setup out of the output (see the ASMS handling in Pipeline.cpp).
+bool CopyTreeNoOverwriteExcluding(const std::wstring& src, const std::wstring& dst,
+                                  const std::vector<std::wstring>& exclDirNames);
+
+// Recursively mirror `src` into `dst`, copying only files whose basename ends
+// with one of `exts` (case-insensitive, e.g. {L".inf", L".sif"}). An empty
+// `exts` vector copies every file. The relative directory layout is recreated
+// either way. `overwrite` selects CopyFileForce vs CopyFileNoOverwrite.
+// Returns false if any individual file failed; `copiedOut` receives the number
+// of files actually copied (files skipped as already-present are not counted).
+bool CopyTreeByExt(const std::wstring& src, const std::wstring& dst,
+                   const std::vector<std::wstring>& exts,
+                   bool overwrite, int& copiedOut);
+
 // Iterate files matching a set of extensions (case-insensitive) in a single dir.
 // extensions e.g. {L".dl_", L".ex_"}. Pass empty vector to get all files.
 std::vector<std::wstring> ListFilesByExt(const std::wstring& dir,
