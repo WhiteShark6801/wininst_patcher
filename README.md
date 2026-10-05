@@ -16,6 +16,9 @@ Integrate multilingual resources into Windows NT 5.x (Windows 2000, XP, Server 2
 - **Cross-architecture support**: Handles WOW64 (32-bit on 64-bit) binary mapping
 - **Service pack integration**: Merges SP*.CAB files during patching
 - **CJK donor-media merge**: For Chinese/Japanese/Korean targets, combines the donor `txtsetup.sif` `[WinntDirectories]`/`[SourceDisksFiles]` sections into the output and copies missing donor arch files (no overwrite)
+- **RTM Base + SP-integrated CJK donor fixes**: Renumbers donor media IDs in `txtsetup.sif`/`layout.inf` and keeps the donor's `ASMS` folder out of the output, so GUI-mode setup can complete on this combination
+- **Post-build recovery mode** (`-p` / `--postbuild-only`): Finish an existing output folder by re-running only the finishing stages, without repeating extraction and resource replacement — useful when a run fails late and you don't want to start over
+- **Honest failure reporting**: Output-folder creation is validated up front, and a run that could not write its output now fails immediately with a non-zero exit code instead of reporting success
 - **Logging**: Comprehensive timestamped logs for debugging failed runs
 
 ---
@@ -105,10 +108,12 @@ The `build.cmd` script:
 ### Command-Line Options
 
 ```
-wininst_patcher.exe [-v|--verbose] [-h|--help]
+wininst_patcher.exe [-v|--verbose] [-p|--postbuild-only] [-h|--help]
 
--v, --verbose   Enable verbose logging output
--h, --help      Display help message and exit
+-v, --verbose         Enable verbose logging output
+-p, --postbuild-only  Finish an existing output folder instead of patching
+                      from scratch (see "Post-Build-Only Recovery Mode")
+-h, --help            Display help message and exit
 ```
 
 ### Interactive Prompts
@@ -120,7 +125,9 @@ wininst_patcher.exe [-v|--verbose] [-h|--help]
 Both must be directories with recognized architecture subdirectories (I386, AMD64, IA64) — either extracted folders on disk or mounted CD/DVD drives.
 
 #### Step 2: Output Folder
-- Will be created if it doesn't exist
+- Must be a fully-qualified absolute path — `C:\Output`, `D:\Media\out`, or a UNC path `\\server\share\out`. Relative paths are rejected.
+- The drive letter must be a **single letter**. A typo such as `7C:\Output` is rejected outright rather than silently failing 20 minutes later.
+- Will be created if it doesn't exist. If it cannot be created, the tool aborts immediately with `[FATAL] Output folder could not be created.` before any staging work begins.
 - If non-empty, you'll be asked to confirm overwrite
 - Contains the patched media tree (ready for nLite)
 
@@ -132,6 +139,61 @@ Choose a processing mode (prompt `Mode [S/F]`):
 - **Full (F)**: Everything is processed like usual — every PE binary gets its resources replaced, PE checksums are re-stamped, and `Driver.cab` / `SP*.CAB` are rebuilt.
 
 If language detection fails for either ISO, replacements still happen but the extracted `.bin` files cannot be renamed to the Base language.
+
+---
+
+## Post-Build-Only Recovery Mode
+
+A full run spends most of its time on Steps 3–7 (extracting compressed binaries, pulling resources out of the donor, and rewriting every PE). If a run dies late — a broken `Driver.cab` build, a cancelled prompt, a machine reboot — you normally have to start that all over again.
+
+`-p` / `--postbuild-only` skips straight to the finishing stages and applies them to an output folder you already have.
+
+```batch
+wininst_patcher.exe -p
+```
+
+### What runs
+
+| Stage | Behaviour |
+|---|---|
+| **Step 1** — Inputs | Processed as normal. You are still asked for the Base and Resource ISO roots, because the fixups resolve against them. |
+| **Step 2** — Output folder | Processed, with different rules (see below). |
+| **Steps 3–10** | **Skipped.** No staging tree is created, no binaries are extracted or patched, no CABs are rebuilt. The output is assumed to already contain the patched binaries. |
+| **Pre-Post-Step-10** — *new* | Base media text files are copied over the output, overwriting existing copies. |
+| **Post-Step 10** — Fixups | Applied in full, as in a normal run. |
+
+Because nothing is extracted or repacked, there is no Safe/Full mode choice — the `Mode [S/F]` prompt is not shown.
+
+### Output folder requirements
+
+These differ from a normal run, and are deliberately stricter:
+
+- The folder **must already exist**. The tool will not create it — creating it would only mask a mistyped path.
+- It must be **writable**. This is verified up front with a scratch-file probe, so a read-only ACL or a stale optical mount is reported immediately instead of failing one INF file at a time.
+- Read-only attributes are cleared across the tree before any fixup runs, because the fixups rewrite `.inf` / `.sif` files in place and would otherwise hit `ERROR_ACCESS_DENIED`.
+- It should be the output folder of the failed run — typically one that is already populated with patched binaries.
+
+### The intermediate copy step
+
+Immediately before the Post-Step 10 fixups, these extensions are copied from the Base ISO into the output, **overwriting** whatever is there:
+
+```
+*.inf    *.in_    *.ca_    *.cat    *.sif
+```
+
+The copy is recursive and recreates the directory layout. Files with any other extension are left alone.
+
+This exists because a run that failed before Step 10 never copied the base media's text files into the output. Without it, the fixups would either fail to find the files they need to edit or edit stale copies, leaving a subtly broken media tree that looks finished.
+
+### When to use it
+
+- A run failed during Step 8 (CAB rebuild) or the post-step fixups
+- You cancelled a run partway through and want the finishing stages applied
+- You have manually corrected files in an existing output tree and want the fixups re-applied
+
+### What it does *not* do
+
+It cannot recover a run that failed during Steps 3–7, because it has no way to rebuild the patched binaries. If extraction or resource replacement never completed, use a full run.
 
 ---
 
@@ -161,7 +223,13 @@ This tree is ready for import into **nLite** or other ISO repackaging tools.
 **Step 1: Architecture & Media Detection**
 - Scans for I386, AMD64, or IA64 directories
 - Detects Windows version (2000, XP, 2003) from marker files
-- Checks for service pack CAB files (SP1.CAB–SP4.CAB)
+- Checks the Base **and** the donor media independently for service pack CAB files (SP1.CAB–SP4.CAB), reporting each one separately:
+  ```
+  [INFO ] Service pack on Base media:     none (RTM)
+  [INFO ] Service pack on Resource media: SP3
+  [INFO ] Service pack processing enabled: yes
+  ```
+  The **Base** level is what selects the Step 7 hex-patch variants, because those patterns are matched against Base binaries. The donor level only decides whether `SP*.CAB` handling runs. A Base and donor at *different* SP levels is allowed and logs a warning; the Base level wins.
 
 **Step 2: Output Configuration**
 - Validates output folder (creates if needed)
@@ -190,10 +258,21 @@ This tree is ready for import into **nLite** or other ISO repackaging tools.
 - Merges string tables, dialogs, menus, accelerators
 - Always runs in Replace fashion: language-specific files (.bin) are renamed to overwrite the base language
 - In Safe mode, `ntoskrnl.exe`, `ntkr*.dll`, and `hal*.dll` are copied through untouched; `driver_bins` and `servicepack_bins` are not processed
+- Each file is named in the log *before* it is processed (`Processing: ...`), so if the run ever dies mid-file, the last line identifies the file rather than its predecessor
+- With `-v`, every resource blob is logged twice - `-> <blob> (<n> bytes)` just before it is submitted and `~ <blob> (<n> bytes)` once it applied - on the screen **and** in the logfile. The last `->` line without a matching `~` is the blob that hit trouble
+- Each file is updated in a short-lived **isolation child process** (`--apply-one`, an internal option). `BeginUpdateResource`/`UpdateResource` build the whole pending resource image in memory and rewrite the target PE on commit; when the Base and donor binaries are different builds, the updater can corrupt its own heap. Windows then reports `STATUS_HEAP_CORRUPTION (0xC0000374)` in `ntdll.dll` at a *later* heap operation, which no `__try`/`__except` around those three calls can catch
+- A child that dies therefore cannot take down the run: the parent logs `RESOURCE UPDATE CRASHED`, restores the pristine Base copy over the output, and carries on. A file that had any faulting blob is treated the same way (`RESOURCE UPDATE FAILED`) instead of committing a half-translated binary
+- Those files stay in the Base language. The run summary lists how many were affected; the `RESOURCE UPDATE FAILED`/`CRASHED` lines name them. Matching the Base and donor builds (same service pack and component set) avoids the problem entirely
 
 **Step 7: Hex Patching (OS-specific)**
 - Applies hand-coded binary patches to `setupapi.dll`, `syssetup.dll`, `sfc_os.dll`
-- Patterns vary by OS version (Win2000, WinXP, Win2003, Win2003x64)
+- Patterns vary by OS version (Win2000, WinXP, Win2003, Win2003x64) **and** by the Base media's service-pack level (XP uses one set below SP2 and another at SP2+; Server 2003 uses one set for RTM and another for SP+)
+- Every pattern is verified after matching. A pattern that finds no match is logged as a warning rather than silently skipped, so a wrong variant selection surfaces immediately:
+  ```
+  [WARN ]     [!] No match for 8BFF558BEC8B452C -> 33C0C230008B452C in SETUPAPI.DLL.
+              The binary does not have the expected layout - check the detected
+              Base OS / service-pack level.
+  ```
 - IA64, DEC Alpha (ALPHA), and Alpha AXP 64-bit (AXP64): Requires manual pre-patched binaries (EPIC/RISC instruction sets are not amenable to automated patching)
 - ALPHA / AXP64 media is treated strictly as Windows 2000 (no XP/Server 2003 exists for it), including the Win2000 KERNEL32/DSSBASE/RSABASE handling — the hex-patching step alone stays manual like IA64
 - ALPHA / AXP64 support is **work in progress** and may not work fully; treat these architectures as experimental.
@@ -214,8 +293,14 @@ This tree is ready for import into **nLite** or other ISO repackaging tools.
 - Overlays patched binaries
 - Preserves directory structure
 
+**Pre-Post-Step 10: Base Media Text Files** *(post-build-only mode only)*
+- Recursively copies `*.inf`, `*.in_`, `*.ca_`, `*.cat` and `*.sif` from the Base ISO into the output, overwriting existing copies
+- Recreates the directory layout; all other extensions are left untouched
+- Restores files that a run failing before Step 10 never copied, so the fixups below edit current copies
+- Not run in a normal full run — Step 10 has already copied the base tree by then
+
 **Post-Step 10: Fixups**
-- When Base/Resource came from mounted CD/DVD media, clears the read-only attribute on the whole output tree (needed so INF edits can succeed)
+- When Base/Resource came from mounted CD/DVD media, clears the read-only attribute on the whole output tree (needed so INF edits can succeed). In post-build-only mode this clearing is unconditional, because the output folder is user-supplied and may have come off optical media regardless of what the inputs look like
 - Copies unpatched critical system files (KERNEL32.DLL, PIDGEN.DLL, rsaenh.DLL, dssenh.DLL)
 - Updates locale settings in INF files (intl.inf, hivesys.inf, hivedef.inf)
 - Merges complex-script language files (Chinese, Japanese, Korean)
@@ -224,8 +309,50 @@ This tree is ready for import into **nLite** or other ISO repackaging tools.
   - The correct donor `[SourceDisksFiles]` block (the one declaring the `c_10003.nls` codepage table) is appended to the output
   - Files from `donor\<donor_arch>` are copied into `output\<base_arch>` **without overwriting** existing files
   - The `[WinntDirectories]`/`[SourceDisksFiles]` placeholders inside the `txtsetup_1028/1041/1042/2052.txt` fixup files are ignored (they are only templates)
+- **(XIV)** When the Base media is **RTM** and the donor ships an **integrated service pack**, two extra corrections run — see [RTM Base + SP-Integrated Donor](#rtm-base--sp-integrated-cjk-donor)
 - Copies Help/HTML documentation from donor ISO
 - Updates txtsetup.sif with new language metadata
+
+---
+
+## RTM Base + SP-Integrated CJK Donor
+
+A CJK donor that ships with an integrated service pack describes its files with media IDs that only exist on the donor's own, larger medium. Step XIII merges those donor `[SourceDisksFiles]` lines into the output, so the output ends up pointing at disks the RTM Base media does not have — and the donor also carries an `ASMS` folder belonging to that service pack.
+
+Both problems are corrected automatically, but **only** when all three conditions hold:
+
+1. The Base media is **RTM** — no `SP1.CAB`–`SP4.CAB` found on it
+2. The donor media **has** a service pack
+3. The target language is **CJK** (Chinese Simplified `2052`, Chinese Traditional `1028`, Korean `1042`, Japanese `1041`)
+
+If the Base media has its own service pack, none of this runs — that combination is already consistent.
+
+### Media ID renumbering
+
+Applied to both `txtsetup.sif` and `layout.inf` in the output. The table depends on the detected Base media generation:
+
+| Base media | Replacements |
+|---|---|
+| Windows 2000 (also ALPHA / AXP64) | `2,,` → `1,,` |
+| Windows XP / Server 2003 (x86) | `100,,` → `1,,` and `107,,` → `7,,` |
+| Windows XP / Server 2003 AMD64 | `155,,` → `55,,` and `156,,` → `56,,`, plus `100,,` → `1,,` and `107,,` → `7,,` |
+| Windows Server 2003 IA64 | *none* — the donor ID scheme is not documented, so the files are left untouched and a warning is logged |
+
+These are literal whole-file substring replacements, so they apply everywhere the fragment occurs, not just on known lines. Every replacement is counted and logged, e.g.:
+
+```
+[XIV]  txtsetup.sif: renumbered 3 media ID fragment(s).
+```
+
+### ASMS folder exclusion
+
+When the combination above applies and the donor has an `ASMS` folder, that folder is skipped during the (XIII) donor file copy — neither the folder nor anything under it is created in the output. Left in place, GUI-mode setup attempts to service it and fails.
+
+The exclusion is applied to the donor tree as it is copied, so it covers `ASMS` whether it sits at the donor root or inside the donor architecture directory.
+
+### If setup still fails
+
+Check the log for `(XIV)` lines. If you see `no known media-ID map for this Base architecture`, the ID table needs an entry for your media — report the Base OS/architecture and the relevant `txtsetup.sif` lines.
 
 ---
 
@@ -242,6 +369,10 @@ This tree is ready for import into **nLite** or other ISO repackaging tools.
 Korean translations have been verified to work end-to-end with this merge. Ensure the donor ISO is the matching CJK language and that the donor architecture directory exists.
 
 > **Note:** `winnt32bbu.dll` (the setup billboard) can be buggy for these languages — it may display garbled or untranslated text. This is a known cosmetic issue with the billboard during WinNT32 setup, unrelated to the txtsetup.sif merge.
+
+### Q: What if the Base ISO is CJK but the Donor is a Western language?
+
+**A:** The tool logs a warning and you should replace `spddlang.sys` in the output with the Western version from a Western ISO (e.g. the donor media). Because the Base is CJK, the output keeps the CJK-specific `spddlang.sys` font-metadata file, which is not appropriate for a Western target — text-mode setup may mis-render fonts or hit font-metadata inconsistencies. Copy a Western `spddlang.sys` (match architectures and build numbers if possible) over the output's version after the patch.
 
 ### Q: Chinese characters are corrupted during text-mode setup.
 
@@ -315,6 +446,22 @@ This mix works because x64 Edition shares core binaries with Server 2003 but WOW
 - Ensure base ISO had valid boot files (ntldr, boot.ini on x86; efi directory on IA64)
 - Check that output media was repackaged with correct ISO 9660 settings
 
+### Hex Patches Didn't Apply (no `[+] Patched ...` lines)
+This almost always means the wrong binary variant was selected, not that the patch failed to apply.
+
+- Look at Step 1 first: `Service pack on Base media:` gives the level used for pattern selection. If it reports `SP3` but you supplied RTM media, the media really does contain `SP1.CAB`–`SP4.CAB` — check the ISO you mounted.
+- If the level is right but patterns still miss, the binary is an unexpected build. Compare the first bytes of `setupapi.dll`/`syssetup.dll` against the `from` column of the patch table in `Pipeline.cpp` and report the mismatch.
+- `Detected Base OS: Windows XP (SP0 / RTM)` now makes an RTM Base explicit — previously this read as `(SP0)`.
+
+### Output Folder Rejected at Step 2
+- **`not a valid absolute path`** — the path was relative (`isos\out`) or malformed. Use a fully-qualified path: `C:\Output`.
+- **`"7C:\folder" is invalid`** — there is more than one character before the colon. This is the classic typo when a stray digit gets prepended to the drive letter. Retype it as `C:\folder`.
+- **`[FATAL] Output folder could not be created. Aborting.`** — the path is well-formed but could not be created. Check free disk space, path length, and permissions. The tool stops here on purpose rather than running the whole pipeline against a destination that does not exist.
+- With `-p`: **`not a directory`** means the output folder must already exist in this mode, and **`[FATAL] Output folder is not writable`** means it exists but cannot be written to.
+
+### A Run Failed and I Don't Want to Start Over
+Use `-p` / `--postbuild-only` to re-apply the finishing stages to the existing output folder. See [Post-Build-Only Recovery Mode](#post-build-only-recovery-mode). Note that it can only finish a run that failed at Step 8 or later — if Steps 3–7 never completed, a full run is required.
+
 ### Language Not Applied
 - Verify language detection worked (check logfile for detected LANGID)
 - Resources are always applied in Replace fashion (Attach mode was retired)
@@ -353,7 +500,8 @@ Bug reports and pull requests are welcome. Please include:
 | Q | A |
 |---|---|
 | **Can I use CD instead of DVD?** | Yes; media type doesn't matter. Both media may be mounted CD/DVD drives used directly, or extracted folders on disk. |
-| **How long does patching take?** | Typically 15–20 minutes on a modern SSD, longer on HDDs. |
+| **A run failed — do I have to start over?** | Not always. `-p` / `--postbuild-only` re-applies the finishing stages (Base text files + Post-Step 10 fixups) to your existing output folder, skipping the slow Steps 3–10. It works for failures at Step 8 or later; failures in Steps 3–7 need a full run. |
+| **How long does patching take?** | Typically 15–20 minutes on a modern SSD, longer on HDDs. `-p` is near-instant by comparison. |
 | **Can I patch multiple languages at once?** | No; run the tool separately for each language pair. |
 | **Do CJK targets (Chinese/Japanese/Korean) need anything extra?** | Yes — use the matching CJK language as the Resource/donor ISO. The tool merges the donor's `txtsetup.sif` sections (`[WinntDirectories]`, `[SourceDisksFiles]`) and copies missing donor files in Post-Step 10. |
 | **Will this work on Windows 7+ ISOs?** | No. This tool targets Windows 2000, XP, and Server 2003 (NT 5.x) only. |
