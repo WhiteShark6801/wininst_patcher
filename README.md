@@ -15,8 +15,11 @@ Integrate multilingual resources into Windows NT 5.x (Windows 2000, XP, Server 2
 - **Automatic layout detection**: Detects Windows 2000, XP, and Server 2003 variants
 - **Cross-architecture support**: Handles WOW64 (32-bit on 64-bit) binary mapping
 - **Service pack integration**: Merges SP*.CAB files during patching
+- **ALPHA comp_bins-only mode**: When the Base media is DEC Alpha, only the compressed binaries (`comp_bins`) are patched. Uncompressed binaries, drivers, `Driver.cab` / `SP*.CAB` and other binaries are copied through unchanged, and the Safe/Full prompt is skipped automatically
+- **ALPHA VGA font expansion**: On Alpha output, every `vgaXXX.fo_` file in the output tree is also expanded to `vgaXXX.fon`
 - **CJK donor-media merge**: For Chinese/Japanese/Korean targets, combines the donor `txtsetup.sif` `[WinntDirectories]`/`[SourceDisksFiles]` sections into the output and copies missing donor arch files (no overwrite)
 - **RTM Base + SP-integrated CJK donor fixes**: Renumbers donor media IDs in `txtsetup.sif`/`layout.inf` and keeps the donor's `ASMS` folder out of the output, so GUI-mode setup can complete on this combination
+- **OEM font/NLS `[SourceDisksFiles]` fixup**: Every output is checked for the font and `.nls` files named by its `[nls]` section; missing `[SourceDisksFiles]` entries are added automatically, for any language and architecture
 - **Post-build recovery mode** (`-p` / `--postbuild-only`): Finish an existing output folder by re-running only the finishing stages, without repeating extraction and resource replacement — useful when a run fails late and you don't want to start over
 - **Honest failure reporting**: Output-folder creation is validated up front, and a run that could not write its output now fails immediately with a non-zero exit code instead of reporting success
 - **Logging**: Comprehensive timestamped logs for debugging failed runs
@@ -138,6 +141,14 @@ Choose a processing mode (prompt `Mode [S/F]`):
 - **Safe (S)**: Boot-critical files are left untouched — `ntoskrnl.exe`, `ntkr*.dll`, and `hal*.dll` pass through unchanged (no resource replacement, no checksum re-stamp), and `driver.cab` / `SP*.CAB` are not processed. The original archives are kept on the output media.
 - **Full (F)**: Everything is processed like usual — every PE binary gets its resources replaced, PE checksums are re-stamped, and `Driver.cab` / `SP*.CAB` are rebuilt.
 
+> **ALPHA Base media:** the `Mode [S/F]` prompt is skipped. The run always uses
+> an automatic comp_bins-only mode: only compressed binaries (`comp_bins`) are
+> resource-patched and rebuilt. `uncomp_bins`, `driver_bins`,
+> `servicepack_bins` and WOW bins are not processed; their Base ISO originals
+> are copied through by Step 9. `Driver.cab` and any `SP*.CAB` stay untouched.
+> After the output is assembled, every `vgaXXX.fo_` in the output tree is also
+> expanded to `vgaXXX.fon` (the `.fo_` source is kept).
+
 If language detection fails for either ISO, replacements still happen but the extracted `.bin` files cannot be renamed to the Base language.
 
 ---
@@ -258,6 +269,7 @@ This tree is ready for import into **nLite** or other ISO repackaging tools.
 - Merges string tables, dialogs, menus, accelerators
 - Always runs in Replace fashion: language-specific files (.bin) are renamed to overwrite the base language
 - In Safe mode, `ntoskrnl.exe`, `ntkr*.dll`, and `hal*.dll` are copied through untouched; `driver_bins` and `servicepack_bins` are not processed
+- On ALPHA Base media, only `comp_bins` is processed; `uncomp_bins`, `driver_bins`, `servicepack_bins` and WOW bins are left as shipped on the Base ISO
 - Each file is named in the log *before* it is processed (`Processing: ...`), so if the run ever dies mid-file, the last line identifies the file rather than its predecessor
 - With `-v`, every resource blob is logged twice - `-> <blob> (<n> bytes)` just before it is submitted and `~ <blob> (<n> bytes)` once it applied - on the screen **and** in the logfile. The last `->` line without a matching `~` is the blob that hit trouble
 - Each file is updated in a short-lived **isolation child process** (`--apply-one`, an internal option). `BeginUpdateResource`/`UpdateResource` build the whole pending resource image in memory and rewrite the target PE on commit; when the Base and donor binaries are different builds, the updater can corrupt its own heap. Windows then reports `STATUS_HEAP_CORRUPTION (0xC0000374)` in `ntdll.dll` at a *later* heap operation, which no `__try`/`__except` around those three calls can catch
@@ -287,11 +299,13 @@ This tree is ready for import into **nLite** or other ISO repackaging tools.
 - Compressed files (`.comp_bins`) re-packed into output architecture directory
 - Uncompressed files copied as-is
 - Driver.cab and SP*.CAB rebuilt (in Safe mode the original archives are kept)
+- On ALPHA Base media only `comp_bins` is rebuilt; uncompressed binaries and archives are copied from the Base ISO unchanged
 
 **Step 10: Media Assembly**
 - Copies all remaining files from base ISO (boot, config, docs)
 - Overlays patched binaries
 - Preserves directory structure
+- On ALPHA output, expands every `vgaXXX.fo_` to `vgaXXX.fon` (the compressed `.fo_` file is kept)
 
 **Pre-Post-Step 10: Base Media Text Files** *(post-build-only mode only)*
 - Recursively copies `*.inf`, `*.in_`, `*.ca_`, `*.cat` and `*.sif` from the Base ISO into the output, overwriting existing copies
@@ -310,6 +324,7 @@ This tree is ready for import into **nLite** or other ISO repackaging tools.
   - Files from `donor\<donor_arch>` are copied into `output\<base_arch>` **without overwriting** existing files
   - The `[WinntDirectories]`/`[SourceDisksFiles]` placeholders inside the `txtsetup_1028/1041/1042/2052.txt` fixup files are ignored (they are only templates)
 - **(XIV)** When the Base media is **RTM** and the donor ships an **integrated service pack**, two extra corrections run — see [RTM Base + SP-Integrated Donor](#rtm-base--sp-integrated-cjk-donor)
+- **(XV)** Universal `[nls]` file-entry fixup: reads `OemHalFont` and the first `.nls` table from `OemCodepage` in the output `[nls]` section and adds the canonical `[SourceDisksFiles]` lines when an entry is missing (e.g. `c_857.nls = 1,,,,,,2_,2,0,0`, `vga857.fon = 1,,,,,,3_,22,0,,,1,2`). Runs for every language and architecture, and never modifies an existing entry
 - Copies Help/HTML documentation from donor ISO
 - Updates txtsetup.sif with new language metadata
 
@@ -335,8 +350,7 @@ Applied to both `txtsetup.sif` and `layout.inf` in the output. The table depends
 |---|---|
 | Windows 2000 (also ALPHA / AXP64) | `2,,` → `1,,` |
 | Windows XP / Server 2003 (x86) | `100,,` → `1,,` and `107,,` → `7,,` |
-| Windows XP / Server 2003 AMD64 | `155,,` → `55,,` and `156,,` → `56,,`, plus `100,,` → `1,,` and `107,,` → `7,,` |
-| Windows Server 2003 IA64 | *none* — the donor ID scheme is not documented, so the files are left untouched and a warning is logged |
+| Windows XP / Server 2003 AMD64 / IA64 | `155,,` → `55,,` and `156,,` → `56,,`, plus `100,,` → `1,,` and `107,,` → `7,,` |
 
 These are literal whole-file substring replacements, so they apply everywhere the fragment occurs, not just on known lines. Every replacement is counted and logged, e.g.:
 
@@ -409,7 +423,7 @@ This mix works because x64 Edition shares core binaries with Server 2003 but WOW
 
 ### Q: How do I patch DEC Alpha (ALPHA) or Alpha AXP 64-bit (AXP64) media?
 
-**A:** **Warning: ALPHA / AXP64 support is work in progress and may not work fully.** These architectures are treated strictly as Windows 2000 (no XP/Server 2003 releases exist for them), receiving the Windows 2000 x86-like handling (Win2000 hex-patch baseline, unpatched KERNEL32/DSSBASE/RSABASE restoration). The hex-patching step itself works like IA64:
+**A:** **Warning: ALPHA / AXP64 support is work in progress and may not work fully.** These architectures are treated strictly as Windows 2000 (no XP/Server 2003 releases exist for them), receiving the Windows 2000 x86-like handling (Win2000 hex-patch baseline, unpatched KERNEL32/DSSBASE/RSABASE restoration). On a 32-bit ALPHA Base, the tool automatically runs in comp_bins-only mode (no Safe/Full prompt): only compressed binaries are patched, while uncompressed binaries, drivers and cabinets stay as shipped. All `vgaXXX.fo_` files in the finished output are also expanded to `vgaXXX.fon`. The hex-patching step itself works like IA64:
 1. Obtain pre-patched `setupapi.dll` and `syssetup.dll` for your Alpha/AXP build
 2. Place them in the tool's input directory
 3. When prompted, copy them to the indicated staging folder
