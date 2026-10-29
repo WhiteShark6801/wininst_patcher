@@ -291,7 +291,8 @@ static bool PopulateFromMedia(const std::wstring& mediaRoot,
                               const std::wstring& uncompBins,
                               const std::wstring& driverBins,
                               const std::wstring& spBins,
-                              const std::wstring& wowBins) {
+                              const std::wstring& wowBins,
+                              bool compOnly) {
     std::wstring i386  = PathJoin(mediaRoot, L"I386");
     std::wstring archD = PathJoin(mediaRoot, ArchDirName(arch));
 
@@ -316,7 +317,9 @@ static bool PopulateFromMedia(const std::wstring& mediaRoot,
     }
 
     // (b) uncompressed PE files in <nativeDir> -> uncomp_bins
-    if (DirExists(nativeDir)) {
+    if (compOnly) {
+        LogInfo(L"  uncomp_bins: skipped (ALPHA comp_bins-only mode)");
+    } else if (DirExists(nativeDir)) {
         int n = 0;
         for (const auto& f : ListFilesByExt(nativeDir, UNCOMP_EXTS)) {
             if (CopyFileForce(f, PathJoin(uncompBins, GetFileNameFromPath(f)))) n++;
@@ -335,6 +338,8 @@ static bool PopulateFromMedia(const std::wstring& mediaRoot,
         }
         if (!drvCab.empty()) ExtractCab(drvCab, driverBins);
         else                 LogWarn(L"  Driver.cab not found on %s", mediaRoot.c_str());
+    } else if (compOnly) {
+        LogInfo(L"  driver.cab: skipped (ALPHA comp_bins-only mode)");
     } else {
         LogInfo(L"  driver.cab: skipped");
     }
@@ -344,13 +349,15 @@ static bool PopulateFromMedia(const std::wstring& mediaRoot,
         std::wstring spCab; int spNum = 0;
         if (HasServicePackCab(mediaRoot, spCab, spNum)) ExtractCab(spCab, spBins);
         else                                            LogInfo(L"  No SP*.CAB on %s", mediaRoot.c_str());
+    } else if (compOnly) {
+        LogInfo(L"  SP*.CAB: skipped (ALPHA comp_bins-only mode)");
     } else {
         LogInfo(L"  SP*.CAB: skipped");
     }
 
     // (e) 64-bit only: WOW = compressed PE files in the *root* \I386 dir.
     // (On 32-bit media there is no WOW; \I386 is the native dir handled above.)
-    if (IsArch64(arch)) {
+    if (!compOnly && IsArch64(arch)) {
         if (DirExists(i386)) {
             int n = 0;
             for (const auto& f : ListFilesByExt(i386, COMP_EXTS)) {
@@ -545,92 +552,6 @@ static TargetOs DetectBaseOs(const std::wstring& iso1Root) {
 static std::wstring ToUpper(std::wstring str) {
     std::transform(str.begin(), str.end(), str.begin(), ::towupper);
     return str;
-}
-
-// Trims whitespace from both ends of a line
-static std::wstring Trim(const std::wstring& str) {
-    size_t first = str.find_first_not_of(L" \t\r\n");
-    if (first == std::wstring::npos) return L"";
-    size_t last = str.find_last_not_of(L" \t\r\n");
-    return str.substr(first, (last - first + 1));
-}
-
-void AddFontToSourceDisksFiles(const std::wstring& txtsetupPath, const std::wstring& vgaFontName) {
-    if (vgaFontName.empty()) {
-        LogWarn(L"Skipping txtsetup.sif font injection: Font filename is empty.");
-        return;
-    }
-
-    std::wifstream inFile(txtsetupPath);
-    if (!inFile.is_open()) {
-        LogError(L"Failed to open txtsetup.sif for reading: %s", txtsetupPath.c_str());
-        return;
-    }
-
-    std::vector<std::wstring> lines;
-    std::wstring line;
-    while (std::getline(inFile, line)) {
-        lines.push_back(line);
-    }
-    inFile.close();
-
-    bool sectionFound = false;
-    size_t targetIndex = 0;
-    bool alreadyExists = false;
-    
-    std::wstring newLine = vgaFontName + L"   = 1,,,,,,3_,22,0,0,,1,2";
-    std::wstring formattedFontUpper = ToUpper(vgaFontName);
-
-    for (size_t i = 0; i < lines.size(); ++i) {
-        std::wstring trimmed = Trim(lines[i]);
-        std::wstring upperLine = ToUpper(trimmed);
-
-        // Robust section matching: checks if the string starts with '[SOURCEDISKSFILES]'
-        if (upperLine.rfind(L"[SOURCEDISKSFILES]", 0) == 0) {
-            sectionFound = true;
-            targetIndex = i + 1;
-            continue;
-        }
-
-        if (sectionFound) {
-            // Next section boundaries
-            if (!upperLine.empty() && upperLine[0] == L'[') {
-                targetIndex = i;
-                break;
-            }
-
-            // Deduplication matching
-            if (upperLine.rfind(formattedFontUpper, 0) == 0) {
-                LogInfo(L"Font %s already exists in [SourceDisksFiles]. Updating entry inline.", vgaFontName.c_str());
-                lines[i] = newLine;
-                alreadyExists = true;
-                break;
-            }
-            
-            targetIndex = i + 1;
-        }
-    }
-
-    if (!sectionFound) {
-        LogError(L"[SourceDisksFiles] section header was not detected in txtsetup.sif.");
-        return;
-    }
-
-    if (!alreadyExists && targetIndex > 0) {
-        lines.insert(lines.begin() + targetIndex, newLine);
-        LogInfo(L"Successfully injected line: '%s' into txtsetup.sif", newLine.c_str());
-    }
-
-    std::wofstream outFile(txtsetupPath, std::ios::trunc);
-    if (!outFile.is_open()) {
-        LogError(L"Failed to open txtsetup.sif for writing: %s", txtsetupPath.c_str());
-        return;
-    }
-
-    for (const auto& l : lines) {
-        outFile << l << L"\n";
-    }
-    outFile.close();
 }
 
 // ---------------------------------------------------------------------------
@@ -1092,8 +1013,9 @@ static bool IsPureInteger(const std::wstring& s) {
 }
 
 // Safe mode: files whose base name matches one of the boot-critical kernel /
-// HAL families, the driver/service-pack archives, or a loose compressed
-// driver are copied through untouched (their resources are never replaced).
+// HAL families, the driver/service-pack archives, or driver binaries
+// (*.sys expanded form + *.sy_ compressed loose form) are copied through
+// untouched (their resources are never replaced, nor checksums re-stamped).
 // Covers both uncompressed and expanded-compressed name forms.
 static bool IsSafeModeExcludedFile(const std::wstring& fileName) {
     std::wstring lower = ToLower(fileName);
@@ -1115,11 +1037,16 @@ static bool IsSafeModeExcludedFile(const std::wstring& fileName) {
         if (digitsOnly) return true;
     }
 
-    // Compressed driver binaries shipped loose on the media.  Drivers stored
-    // inside Driver.cab / SP*.CAB are already covered by the cab exclusions
-    // above (and their contents are never unpacked to loose names in the
-    // safe-mode flow).
+    // Driver binaries shipped loose on the media, in both forms:
+    //   *.sys - expanded in staging (comp_bins/uncomp_bins) + uncompressed
+    //           on media; this is what ReplaceResources/FixCheckSumsInTree see.
+    //   *.sy_ - compressed loose form on the original ISO; this is what the
+    //           post-run restore pass sees.
+    // Drivers stored inside Driver.cab / SP*.CAB are already covered by the
+    // cab exclusions above (and their contents are never unpacked to loose
+    // names in the safe-mode flow).
     if (EndsWithI(lower, L".sy_"))       return true;
+    if (EndsWithI(lower, L".sys"))       return true;
     return false;
 }
 
@@ -1127,8 +1054,8 @@ static bool IsSafeModeExcludedFile(const std::wstring& fileName) {
 // from the Base ISO onto the output media, mirroring its relative path and
 // overwriting whatever the pipeline wrote (e.g. a re-compressed .ex_/.sy_).
 // This guarantees the boot-critical kernel/HAL family, Driver.cab / SP*.CAB
-// and loose compressed drivers on the output are byte-identical to the Base
-// ISO originals.
+// and loose drivers (*.sys / *.sy_) on the output are byte-identical
+// to the Base ISO originals.
 static void SafeModeRestoreExcludedFiles(const std::wstring& iso1Root,
                                          const std::wstring& outRoot,
                                          int& count) {
@@ -1165,6 +1092,80 @@ static void SafeModeRestoreExcludedFiles(const std::wstring& iso1Root,
     if (count > 0) {
         LogInfo(L"  Safe-mode restore: %d excluded file(s) copied from Base ISO.", count);
     }
+}
+
+// ---------------------------------------------------------------------------
+// ALPHA: expand compressed VGA font files in the output tree
+//
+// Alpha media ships most VGA fonts as compressed vgaXXX.fo_ files while
+// txtsetup.sif refers to vgaXXX.fon. Expand every vgaXXX.fo_ in the finished
+// output tree so both the compressed and the usable uncompressed font exist.
+// The .fo_ source is left in place; only a .fon copy is produced (existing
+// .fon files of the same name are replaced).
+// ---------------------------------------------------------------------------
+static bool ExpandAlphaVgaFontsInDir(const std::wstring& dir,
+                                     int& expanded, int& failed) {
+    if (!DirExists(dir)) return true;
+
+    WIN32_FIND_DATAW fd = {};
+    std::wstring pattern = PathJoin(dir, L"*");
+    HANDLE h = FindFirstFileW(pattern.c_str(), &fd);
+    if (h == INVALID_HANDLE_VALUE) return true;
+
+    bool allOk = true;
+    do {
+        if (wcscmp(fd.cFileName, L".") == 0 || wcscmp(fd.cFileName, L"..") == 0) continue;
+        std::wstring full = PathJoin(dir, fd.cFileName);
+
+        if (fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) {
+            if (!ExpandAlphaVgaFontsInDir(full, expanded, failed)) allOk = false;
+            continue;
+        }
+
+        std::wstring fileName = fd.cFileName;
+        std::wstring lower = ToLower(fileName);
+        if (!StartsWithI(lower, L"vga") || !EndsWithI(lower, L".fo_")) continue;
+
+        // Drop the ".fo_" suffix and add ".fon" (e.g. VGA737.FO_ -> VGA737.fon).
+        std::wstring stem = fileName.substr(0, fileName.size() - 4);
+        std::wstring dst  = PathJoin(dir, stem + L".fon");
+
+        // A Base ISO may already carry an uncompressed .FON of the same name.
+        // Replace it so every vgaXXX.fo_ ends up with the expanded .fon.
+        DWORD attrs = GetFileAttributesW(dst.c_str());
+        if (attrs != INVALID_FILE_ATTRIBUTES) {
+            SetFileAttributesW(dst.c_str(), FILE_ATTRIBUTE_NORMAL);
+            if (!DeleteFileW(dst.c_str()) && GetLastError() != ERROR_FILE_NOT_FOUND) {
+                LogError(L"  ALPHA font: cannot replace %s (error %lu)",
+                         dst.c_str(), GetLastError());
+                failed++;
+                allOk = false;
+                continue;
+            }
+        }
+
+        LogInfo(L"  ALPHA font: expanding %s -> %s",
+                fd.cFileName, GetFileNameFromPath(dst).c_str());
+        std::wstring cmd = L"expand.exe \"" + full + L"\" \"" + dst + L"\"";
+        int rc = RunCommand(cmd);
+        if (rc != 0) {
+            LogError(L"  ALPHA font: expand failed (rc=%d) for %s", rc, full.c_str());
+            failed++;
+            allOk = false;
+        } else {
+            expanded++;
+        }
+    } while (FindNextFileW(h, &fd));
+    FindClose(h);
+    return allOk;
+}
+
+static bool ExpandAlphaVgaFonts(const std::wstring& outRoot) {
+    LogInfo(L"\n=== ALPHA: expand VGA fonts (vgaXXX.fo_ -> vgaXXX.fon) ===");
+    int expanded = 0, failed = 0;
+    bool ok = ExpandAlphaVgaFontsInDir(outRoot, expanded, failed);
+    LogInfo(L"  expanded %d VGA font(s), %d failed.", expanded, failed);
+    return ok;
 }
 
 
@@ -1258,6 +1259,13 @@ static bool RunPostBuildOnly(Paths& p, Arch arch1, Arch arch2,
         return false;
     }
     ApplyHelpHtmlOverwrites(p.output, p.iso2);
+    if (arch1 == Arch::ALPHA) {
+        if (!ExpandAlphaVgaFonts(p.output)) {
+            LogError(L"ALPHA VGA font expansion failed.");
+            wprintf(L"\n=== FAILED: ALPHA VGA font expansion did not complete - see the log ===\n");
+            return false;
+        }
+    }
 
     LogInfo(L"Done. Output is at %s", p.output.c_str());
     return true;
@@ -1337,6 +1345,15 @@ bool RunPipeline(bool postBuildOnly) {
     }
 
     bool doWow = IsArch64(arch1);
+
+    // ALPHA media is handled in an automatic comp_bins-only mode:
+    //   - only the Base/Resource comp_bins folders are treated as binaries
+    //   - uncomp_bins, driver_bins, servicepack_bins and WOW bins are skipped
+    //     and the originals are copied through by Step 9
+    //   - the Safe/Full prompt is skipped entirely
+    // This keeps the uncompressed Alpha binaries and the vendor Driver.cab /
+    // SP*.CAB byte-identical to the Base ISO.
+    bool alphaCompOnly = (arch1 == Arch::ALPHA);
 
     // ---------------- Step 2 ----------------
     wprintf(L"\n=== Step 2: Output folder ===\n");
@@ -1439,24 +1456,33 @@ bool RunPipeline(bool postBuildOnly) {
         return RunPostBuildOnly(p, arch1, arch2, lang1, lang2, gotLang1, gotLang2);
     }
 
-    // Mode prompt: Safe (S) or Full (F)
-    wprintf(L"Choose how the Base ISO should be processed:\n");
-    wprintf(L"  S  Safe  - boot-critical files are left untouched: ntoskrnl.exe,\n");
-    wprintf(L"             ntkr*.exe and hal*.dll pass through unchanged, driver.cab\n");
-    wprintf(L"             / SP*.CAB are not processed (the originals are kept),\n");
-    wprintf(L"             and loose *.sy_ driver files are left as-is.\n");
-    wprintf(L"  F  Full  - process everything like usual (every PE binary gets its\n");
-    wprintf(L"             resources replaced and Driver.cab / SP*.CAB rebuilt).\n");
-    wprintf(L"\n");
-
+    // Mode prompt: Safe (S) or Full (F). ALPHA media is processed in an
+    // automatic comp_bins-only mode, so the prompt is skipped for it.
     bool safeMode = false;
-    while (true) {
-        std::wstring ans = Prompt(L"Mode [S/F]: ");
-        if (ans.empty()) continue;
-        wchar_t c = (wchar_t)::towupper(ans[0]);
-        if (c == L'S') { safeMode = true;  break; }
-        if (c == L'F') { safeMode = false; break; }
-        wprintf(L"  please enter S or F.\n");
+    if (alphaCompOnly) {
+        wprintf(L"ALPHA base media detected: using automatic comp_bins-only mode.\n");
+        wprintf(L"Only compressed binaries (comp_bins) are processed; uncompressed\n");
+        wprintf(L"binaries, drivers, Driver.cab / SP*.CAB and other binaries are\n");
+        wprintf(L"copied through unchanged. The Safe/Full prompt is skipped.\n");
+        wprintf(L"\n");
+    } else {
+        wprintf(L"Choose how the Base ISO should be processed:\n");
+        wprintf(L"  S  Safe  - boot-critical files are left untouched: ntoskrnl.exe,\n");
+        wprintf(L"             ntkr*.exe and hal*.dll pass through unchanged, driver.cab\n");
+        wprintf(L"             / SP*.CAB are not processed (the originals are kept),\n");
+        wprintf(L"             and loose *.sys / *.sy_ driver files are left as-is.\n");
+        wprintf(L"  F  Full  - process everything like usual (every PE binary gets its\n");
+        wprintf(L"             resources replaced and Driver.cab / SP*.CAB rebuilt).\n");
+        wprintf(L"\n");
+
+        while (true) {
+            std::wstring ans = Prompt(L"Mode [S/F]: ");
+            if (ans.empty()) continue;
+            wchar_t c = (wchar_t)::towupper(ans[0]);
+            if (c == L'S') { safeMode = true;  break; }
+            if (c == L'F') { safeMode = false; break; }
+            wprintf(L"  please enter S or F.\n");
+        }
     }
 
     // Attach mode has been retired: resources are always applied in the old
@@ -1474,22 +1500,32 @@ bool RunPipeline(bool postBuildOnly) {
         LogInfo(L"Both ISOs have the same language; nothing to rename.");
         doRename = false;
     }
-    LogInfo(L"Processing mode: %s", safeMode ? L"SAFE (skip ntoskrnl/ntkr*/hal* + driver.cab + SP*.CAB)"
-                                            : L"FULL (process everything)");
+    if (alphaCompOnly) {
+        LogInfo(L"Processing mode: ALPHA COMP_BINS-ONLY (automatic; Safe/Full prompt skipped)");
+    } else {
+        LogInfo(L"Processing mode: %s", safeMode ? L"SAFE (skip ntoskrnl/ntkr*/hal* + driver.cab + SP*.CAB + *.sys/*.sy_)"
+                                                : L"FULL (process everything)");
+    }
     LogInfo(L"Resource application: %s",
             doRename ? L"REPLACE (rename .bin lang suffix to Base)"
                      : L"REPLACE (no rename possible - keeping suffixes as-is)");
 
     // Safe mode also disables Driver.cab and SP*.CAB end-to-end so those
     // archives and their contents reach the output untouched.
-    bool doDriver = !safeMode;
-    if (safeMode) {
+    bool doDriver = !safeMode && !alphaCompOnly;
+    if (alphaCompOnly) {
+        doSp = false;
+        doWow = false;
+        LogInfo(L"ALPHA comp_bins-only mode: uncomp_bins, driver_bins, servicepack_bins");
+        LogInfo(L"and wow_bins are not processed - the Base ISO originals are kept.");
+    } else if (safeMode) {
         LogInfo(L"Safe mode: driver.cab processing disabled - original archive kept.");
         if (doSp) {
             LogInfo(L"Safe mode: SP*.CAB processing disabled - original archive kept.");
             doSp = false;
         }
         LogInfo(L"Safe mode: kernel/HAL binaries (ntoskrnl, ntkr*, hal*) left untouched.");
+        LogInfo(L"Safe mode: loose driver binaries (*.sys / *.sy_) left untouched.");
     }
 
     // ---------------- Step 3 ----------------
@@ -1504,12 +1540,14 @@ bool RunPipeline(bool postBuildOnly) {
                       p.iso1CompBins, p.iso1UncompBins,
                       doDriver ? p.iso1DriverBins : L"",
                       doSp ? p.iso1ServicepackBins : L"",
-                      doWow ? p.iso1WowBins : L"");
+                      doWow ? p.iso1WowBins : L"",
+                      alphaCompOnly);
     PopulateFromMedia(p.iso2, arch2,
                       p.iso2CompBins, p.iso2UncompBins,
                       doDriver ? p.iso2DriverBins : L"",
                       doSp ? p.iso2ServicepackBins : L"",
-                      doWow ? p.iso2WowBins : L"");
+                      doWow ? p.iso2WowBins : L"",
+                      alphaCompOnly);
 
     // Clear R/H/S attributes on uncomp_bins (files copied from CD/DVD inherit
     // read-only). BeginUpdateResource refuses read-only files.
@@ -1527,14 +1565,6 @@ bool RunPipeline(bool postBuildOnly) {
 
     // ---------------- Cross-arch w-prefix strip ----------------
     // When the Base is 64-bit (AMD64/IA64) and the donor is 32-bit (i386),
-    // the Base's WOW binaries are prefixed with 'w' (e.g. "waccess.cpl") to
-    // distinguish them from native 64-bit ones. The donor has the unprefixed
-    // names (e.g. "access.cpl"), so the extracted .bin filenames key off the
-    // unprefixed name. To make resource matching work, we rename the Base's
-    // w-prefixed files to their unprefixed form here, and rename them back
-    // after step 7 so step 8 can compress them under their original names.
-    // ---------------- Cross-arch w-prefix strip ----------------
-    // When the Base is 64-bit (AMD64/IA64) and the donor is 32-bit (i386),
     // the Base's WOW binaries (the ones in <root>\I386 of the 64-bit medium)
     // are prefixed with 'w' (e.g. "waccess.cpl") to distinguish them from
     // their native 64-bit counterparts. The donor has the unprefixed names
@@ -1542,8 +1572,9 @@ bool RunPipeline(bool postBuildOnly) {
     // unprefixed name. To make resource matching work, we rename only the
     // Base's wow_bins entries to their unprefixed form here, and rename them
     // back after step 7 so step 8 emits the original names.
+    // Skipped on ALPHA: WOW bins are not processed in comp_bins-only mode.
     std::vector<WRename> wLog;
-    bool wStrip = (arch1 != Arch::X86) && (arch2 == Arch::X86);
+    bool wStrip = !alphaCompOnly && (arch1 != Arch::X86) && (arch2 == Arch::X86);
     if (wStrip) {
         wprintf(L"\n=== Cross-arch: stripping 'w' prefix on Base wow_bins ===\n");
         int n = StripWPrefixInDir(p.iso1WowBins, wLog);
@@ -1555,10 +1586,14 @@ bool RunPipeline(bool postBuildOnly) {
     // comp_bins / wow_bins were already expanded to real PE extensions in
     // Step 4, so they can be fed directly to the extractor.
     ExtractResourcesFromFolder(p.iso2CompBins,        p.resources);
-    ExtractResourcesFromFolder(p.iso2UncompBins,      p.resources);
-    if (doDriver) ExtractResourcesFromFolder(p.iso2DriverBins, p.resources);
-    if (doSp)     ExtractResourcesFromFolder(p.iso2ServicepackBins, p.resources);
-    if (doWow)    ExtractResourcesFromFolder(p.iso2WowBins, p.resources);
+    if (!alphaCompOnly) {
+        ExtractResourcesFromFolder(p.iso2UncompBins, p.resources);
+        if (doDriver) ExtractResourcesFromFolder(p.iso2DriverBins, p.resources);
+        if (doSp)     ExtractResourcesFromFolder(p.iso2ServicepackBins, p.resources);
+        if (doWow)    ExtractResourcesFromFolder(p.iso2WowBins, p.resources);
+    } else {
+        LogInfo(L"  ALPHA comp_bins-only mode: resource extraction limited to comp_bins.");
+    }
 
     // Replace mode: rename _lang<src>.bin -> _lang<dst>.bin so they overwrite
     // the Base ISO's existing language slot rather than adding a new one.
@@ -1571,10 +1606,14 @@ bool RunPipeline(bool postBuildOnly) {
     wprintf(L"\n=== Step 6: Replace resources on Base ISO binaries ===\n");
     ResourceExcludeFn exclude = safeMode ? IsSafeModeExcludedFile : nullptr;
     ReplaceResources(p.iso1CompBins,        p.resources, p.procComp,        false, exclude);
-    ReplaceResources(p.iso1UncompBins,      p.resources, p.procUncomp,      false, exclude);
-    if (doDriver) ReplaceResources(p.iso1DriverBins,      p.resources, p.procDriver,      false, nullptr);
-    if (doSp)     ReplaceResources(p.iso1ServicepackBins, p.resources, p.procServicepack, false, nullptr);
-    if (doWow)    ReplaceResources(p.iso1WowBins,         p.resources, p.procWow,         false, exclude);
+    if (!alphaCompOnly) {
+        ReplaceResources(p.iso1UncompBins, p.resources, p.procUncomp, false, exclude);
+        if (doDriver) ReplaceResources(p.iso1DriverBins,      p.resources, p.procDriver,      false, nullptr);
+        if (doSp)     ReplaceResources(p.iso1ServicepackBins, p.resources, p.procServicepack, false, nullptr);
+        if (doWow)    ReplaceResources(p.iso1WowBins,         p.resources, p.procWow,         false, exclude);
+    } else {
+        LogInfo(L"  ALPHA comp_bins-only mode: resource replacement limited to comp_bins.");
+    }
 
     // Make sure patched output is writable for the checksum patch step.
     ClearReadOnlyInDir(p.procComp);
@@ -1621,8 +1660,12 @@ bool RunPipeline(bool postBuildOnly) {
     if (!CompressFolderPerFile(p.procComp, outArchDir)) buildOk = false;
 
     // 8b) copy proc_uncomp -> outArchDir
-    LogInfo(L"  (b) copying uncomp_bins -> %s", outArchDir.c_str());
-    if (!CopyTreeForce(p.procUncomp, outArchDir)) buildOk = false;
+    if (alphaCompOnly) {
+        LogInfo(L"  (b) skipped (ALPHA comp_bins-only mode) - uncompressed binaries stay as shipped.");
+    } else {
+        LogInfo(L"  (b) copying uncomp_bins -> %s", outArchDir.c_str());
+        if (!CopyTreeForce(p.procUncomp, outArchDir)) buildOk = false;
+    }
 
     // 8c) driver merge + Driver.cab
     if (doDriver) {
@@ -1664,6 +1707,8 @@ bool RunPipeline(bool postBuildOnly) {
                 buildOk = false;
             }
         }
+    } else if (alphaCompOnly) {
+        LogInfo(L"  (c) skipped (ALPHA comp_bins-only mode) - original Driver.cab kept.");
     } else {
         LogInfo(L"  (c) skipped - original Driver.cab kept on the output media.");
     }
@@ -1684,6 +1729,8 @@ bool RunPipeline(bool postBuildOnly) {
         } else {
             LogWarn(L"  Could not determine SP number; skipping CAB build.");
         }
+    } else if (alphaCompOnly) {
+        LogInfo(L"  (d) skipped (ALPHA comp_bins-only mode) - original SP*.CAB kept.");
     }
 
     // 8e) compress proc_wow -> I386 (only on 64-bit)
@@ -1714,6 +1761,9 @@ PostStep10Fixups(p.output, p.iso1, p.iso2, arch1, arch2,
                      gotLang2 ? lang2 : 0,
                      true);  // Attach mode retired: always Replace
  	ApplyHelpHtmlOverwrites(p.output, p.iso2);
+    if (alphaCompOnly) {
+        if (!ExpandAlphaVgaFonts(p.output)) buildOk = false;
+    }
     if (safeMode) {
         wprintf(L"\n=== Safe mode: restore excluded files from Base ISO ===\n");
         SafeModeRestoreExcludedFiles(p.iso1, p.output);
@@ -2645,36 +2695,6 @@ std::vector<std::wstring> CollectCjkSourceDisksLines(const std::wstring& text) {
 
 } // anonymous namespace
 
-std::wstring ExtractOemHalFont(const std::wstring& nlsBody) {
-    std::wstring targetKey = L"OemHalFont";
-    size_t pos = nlsBody.find(targetKey);
-    if (pos == std::wstring::npos) {
-        return L"";
-    }
-
-    // Locate the equals sign after the key
-    size_t eqPos = nlsBody.find(L"=", pos + targetKey.length());
-    if (eqPos == std::wstring::npos) {
-        return L"";
-    }
-
-    // Find where the line ends (\r or \n)
-    size_t endPos = nlsBody.find_first_of(L"\r\n", eqPos);
-    if (endPos == std::wstring::npos) {
-        endPos = nlsBody.length();
-    }
-
-    // Extract raw value string
-    std::wstring val = nlsBody.substr(eqPos + 1, endPos - (eqPos + 1));
-
-    // Clean up spaces/whitespace surrounding the filename
-    size_t first = val.find_first_not_of(L" \t");
-    if (first == std::wstring::npos) return L"";
-    size_t last = val.find_last_not_of(L" \t");
-    
-    return val.substr(first, (last - first + 1));
-}
-
 // ---------------------------------------------------------------------------
 // CJK donor media merge (Post-step-10, XIII)
 // ---------------------------------------------------------------------------
@@ -2737,6 +2757,103 @@ static int AppendSectionLinesDedup(std::wstring& text,
 }
 
 // ---------------------------------------------------------------------------
+// Universal OemHalFont / OemCodepage [SourceDisksFiles] fixup
+// ---------------------------------------------------------------------------
+// Setup resolves the OEM font and NLS codepage tables through
+// [SourceDisksFiles]. Some media reference them from [nls], e.g.
+//   OemHalFont  = vga857.fon
+//   OemCodepage = c_857.nls,857,c_437.nls,437
+// but ship no matching [SourceDisksFiles] lines, so GUI-mode setup cannot
+// locate the files. Read the names back from the output [nls] section and add
+// the canonical lines when an entry is missing. Existing entries are never
+// modified. Runs for every language and architecture.
+static std::wstring CleanNlsToken(const std::wstring& raw) {
+    std::wstring t = TrimWS(raw);
+    if (t.size() >= 2 && t.front() == L'"' && t.back() == L'"')
+        t = TrimWS(t.substr(1, t.size() - 2));
+    return t;
+}
+
+// Value of `key` (e.g. OemHalFont) inside a [nls] section body, or empty.
+static std::wstring NlsKeyValue(const std::wstring& body, const wchar_t* key) {
+    const size_t klen = wcslen(key);
+    for (const auto& raw : SplitBodyLines(body)) {
+        std::wstring t = TrimWS(raw);
+        if (t.size() <= klen) continue;
+        if (_wcsnicmp(t.c_str(), key, klen) != 0) continue;
+        size_t p = klen;
+        while (p < t.size() && (t[p] == L' ' || t[p] == L'\t')) p++;
+        if (p >= t.size() || t[p] != L'=') continue;
+        std::wstring val = TrimWS(t.substr(p + 1));
+        size_t semi = val.find(L';');   // drop a trailing comment
+        if (semi != std::wstring::npos) val = TrimWS(val.substr(0, semi));
+        return CleanNlsToken(val);
+    }
+    return L"";
+}
+
+static void EnsureOemNlsSourceDisksEntries(const std::wstring& sifPath) {
+    std::wstring text;
+    InfEnc enc = InfEnc::Utf8;
+    if (!LoadInfText(sifPath, text, &enc)) {
+        LogWarn(L"  (XV)  could not read %s", sifPath.c_str());
+        return;
+    }
+
+    TargetSection nls;
+    if (!FindSection(text, L"nls", nls)) {
+        LogInfo(L"  (XV)  no [nls] section in %s - nothing to add.",
+                GetFileNameFromPath(sifPath).c_str());
+        return;
+    }
+    std::wstring nlsBody = text.substr(nls.headerEnd, nls.bodyEnd - nls.headerEnd);
+
+    // OemHalFont -> font file name (use the bare file name, no directory).
+    std::wstring fontName;
+    std::wstring fontValue = NlsKeyValue(nlsBody, L"OemHalFont");
+    if (!fontValue.empty()) fontName = GetFileNameFromPath(fontValue);
+
+    // OemCodepage -> "file,cp,file,cp,..." - take the first .nls table, which
+    // is the primary OEM codepage; the others are fallbacks.
+    std::wstring nlsName;
+    std::wstring cpValue = NlsKeyValue(nlsBody, L"OemCodepage");
+    size_t start = 0;
+    while (start <= cpValue.size()) {
+        size_t comma = cpValue.find(L',', start);
+        std::wstring tok = CleanNlsToken(cpValue.substr(
+            start, comma == std::wstring::npos ? std::wstring::npos : comma - start));
+        if (EndsWithI(tok, L".nls")) { nlsName = GetFileNameFromPath(tok); break; }
+        if (comma == std::wstring::npos) break;
+        start = comma + 1;
+    }
+
+    std::vector<std::wstring> needed;
+    if (!nlsName.empty())  needed.push_back(nlsName  + L" = 1,,,,,,2_,2,0,0");
+    if (!fontName.empty()) needed.push_back(fontName + L" = 1,,,,,,,22,0,0");
+
+    if (needed.empty()) {
+        LogInfo(L"  (XV)  %s: [nls] names no OemHalFont/OemCodepage files.",
+                GetFileNameFromPath(sifPath).c_str());
+        return;
+    }
+
+    int added = AppendSectionLinesDedup(text, L"SourceDisksFiles", needed);
+    if (added == 0) {
+        LogInfo(L"  (XV)  %s: OemHalFont/OemCodepage entries already present.",
+                GetFileNameFromPath(sifPath).c_str());
+        return;
+    }
+    if (!SaveInfText(sifPath, text, enc)) {
+        LogWarn(L"  (XV)  could not write %s", sifPath.c_str());
+        return;
+    }
+    LogInfo(L"  (XV)  %s: added %d missing [SourceDisksFiles] entry/entries (%s%s%s).",
+            GetFileNameFromPath(sifPath).c_str(), added,
+            nlsName.c_str(), (!nlsName.empty() && !fontName.empty()) ? L", " : L"",
+            fontName.c_str());
+}
+
+// ---------------------------------------------------------------------------
 // (XIV) RTM Base + service-pack-integrated donor (CJK targets)
 //
 // A CJK donor that ships with an integrated service pack describes its files
@@ -2770,26 +2887,26 @@ static const std::vector<MediaIdRemap>& RtmDonorMediaIdRemaps(TargetOs os) {
         { L"100,,", L"1,,"  },
         { L"107,,", L"7,,"  },
     };
-    // AMD64 media carries both the native 64-bit IDs (155/156) and the x86
-    // emulation IDs (100/107) in the same txtsetup.sif / layout.inf, so the
-    // XP/2003 pair is applied here as well. The four fragments share no prefix
-    // with one another, so the order they are applied in is irrelevant.
-    static const std::vector<MediaIdRemap> kXp2003Amd64 = {
+    // 64-bit media (AMD64 and IA64) carry both the native 64-bit IDs (155/156)
+    // and the x86 emulation IDs (100/107) in the same txtsetup.sif / layout.inf,
+    // so the XP/2003 pair is applied here as well. The renumbering runs under
+    // the same CJK RTM-Base/SP-donor conditions as the other Base generations.
+    // The four fragments share no prefix with one another, so the order they
+    // are applied in is irrelevant.
+    static const std::vector<MediaIdRemap> kXp200364Bit = {
         { L"155,,", L"55,," },
         { L"156,,", L"56,," },
         { L"100,,", L"1,,"  },
         { L"107,,", L"7,,"  },
     };
-    // IA64 media: the donor ID scheme is not documented, so nothing is
-    // renumbered rather than guessing. The call site logs this.
     static const std::vector<MediaIdRemap> kNone = {};
 
     switch (os) {
         case TargetOs::Win2000:     return kWin2000;
         case TargetOs::WinXP:       return kXp2003;
         case TargetOs::Win2003:     return kXp2003;
-        case TargetOs::Win2003x64:  return kXp2003Amd64;
-        case TargetOs::Win2003IA64: return kNone;
+        case TargetOs::Win2003x64:  return kXp200364Bit;
+        case TargetOs::Win2003IA64: return kXp200364Bit;
     }
     return kNone;
 }
@@ -3348,7 +3465,6 @@ static bool PostStep10Fixups(const std::wstring& outRoot,
             if (sifPath.empty()) {
                 LogWarn(L"  (XII) txtsetup.sif not found under %s", outRoot.c_str());
             } else {
-                bool nlsUpdated = false;
                 std::wstring nlsBody = NlsSectionForLang(newLang);
 
                 if (nlsBody.empty()) {
@@ -3361,7 +3477,6 @@ static bool PostStep10Fixups(const std::wstring& outRoot,
                         // Complex-script language: already handled by Step VII
                         LogInfo(L"  (XII) [nls] for %s already handled by Step VII.",
                                 LangIdName(newLang));
-                        nlsUpdated = true; // Mark true to allow font processing
                     }
                 } else {
                     // Synthesise a minimal [nls] block and use the existing
@@ -3375,39 +3490,27 @@ static bool PostStep10Fixups(const std::wstring& outRoot,
                         LogInfo(L"  (XII) %s: [nls] replaced for %s",
                                 GetFileNameFromPath(sifPath).c_str(),
                                 LangIdName(newLang));
-                        nlsUpdated = true;
                     }
-                }
-
-                // If the NLS infrastructure is active/ready, append structural font mappings
-                // (XII) Append font file mapping to [SourceDisksFiles] inside txtsetup.sif
-                if (nlsUpdated) {
-                    std::wstring fontFilename;
-                
-                    // Try extracting directly from the matching NlsSectionForLang text block
-                    if (!nlsBody.empty()) {
-                        fontFilename = ExtractOemHalFont(nlsBody);
-                    }
-                
-                    // CJK Layout or extraction fallback logic
-                    if (fontFilename.empty()) {
-                        std::wstring langTag = CjkLangTag(newLang);
-                        if (!langTag.empty()) {
-                            fontFilename = L"vgaoem.fon"; // Standard CJK setup font fallback
-                        } else {
-                            fontFilename = L"vgaoem.fon"; // Generic Western fallback
-                        }
-                    }
-                
-                    LogInfo(L"  (XII) Appending font file mappings (%s) to [SourceDisksFiles] for %s...", 
-                            fontFilename.c_str(), LangIdName(newLang));
-                    
-                    AddFontToSourceDisksFiles(sifPath, fontFilename);
                 }
             }
         }
     } else {
         LogInfo(L"  (VII-XII) skipped (no donor lang detected).");
+    }
+
+    // (XV) Universal fixup: make sure the OEM font and NLS tables referenced
+    // from the output [nls] section have [SourceDisksFiles] entries. Runs for
+    // every language and architecture, even when no donor language was
+    // detected, so setup can always resolve those files.
+    {
+        std::wstring sifPath = FindOutputFile(outRoot, archDir, L"txtsetup.sif");
+        if (sifPath.empty()) sifPath = FindOutputFile(outRoot, archDir, L"TXTSETUP.SIF");
+        if (sifPath.empty()) {
+            LogWarn(L"  (XV)  txtsetup.sif not found under %s - OEM font/NLS "
+                    L"[SourceDisksFiles] entries not checked.", outRoot.c_str());
+        } else {
+            EnsureOemNlsSourceDisksEntries(sifPath);
+        }
     }
 
     return true;
