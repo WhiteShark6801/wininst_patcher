@@ -12,9 +12,11 @@ Integrate multilingual resources into Windows NT 5.x (Windows 2000, XP, Server 2
 - **Language resource extraction**: Automatically extracts .RES/.MUI resources from PE files
 - **PE resource patching**: Merges donor language resources into base ISO binaries
 - **PE checksum re-stamping**: Recalculates and updates PE headers to pass signature checks
+- **Recommended hex patching**: Hand-coded `setupapi.dll` / `syssetup.dll` patches apply the remaining setup-side changes. Not mandatory — every output also gets a generated `WINNT.SIF` with `DriverSigningPolicy=Ignore` / `NonDriverSigningPolicy=Ignore`, so driver-signing warnings do not appear during GUI-mode setup even without the hex edits
 - **Automatic layout detection**: Detects Windows 2000, XP, and Server 2003 variants
 - **Cross-architecture support**: Handles WOW64 (32-bit on 64-bit) binary mapping
 - **Service pack integration**: Merges SP*.CAB files during patching
+- **Safe mode**: Reads the boot-critical file list from the Base ISO's `txtsetup.sif` (the `findstr /r ",_[1-9] ,[1-9]_"` set) plus `ntoskrnl.exe`, `usetup.exe` and `smss.exe`, deletes those files from both staging trees (`_work\ISO_1`, `_work\ISO_2`) before any patching, and keeps `driver.cab` / `SP*.CAB` untouched. Because `smss.exe` stays unchanged, text-mode setup remains in the Base language (untranslated)
 - **ALPHA comp_bins-only mode**: When the Base media is DEC Alpha, only the compressed binaries (`comp_bins`) are patched. Uncompressed binaries, drivers, `Driver.cab` / `SP*.CAB` and other binaries are copied through unchanged, and the Safe/Full prompt is skipped automatically
 - **ALPHA VGA font expansion**: On Alpha output, every `vgaXXX.fo_` file in the output tree is also expanded to `vgaXXX.fon`
 - **CJK donor-media merge**: For Chinese/Japanese/Korean targets, combines the donor `txtsetup.sif` `[WinntDirectories]`/`[SourceDisksFiles]` sections into the output and copies missing donor arch files (no overwrite)
@@ -138,7 +140,7 @@ Both must be directories with recognized architecture subdirectories (I386, AMD6
 The tool auto-detects language IDs from `hivedef.inf` (INTL_LOCALE). Resources are **always** applied in Replace fashion (the old Attach mode has been retired): extracted `.bin` files are renamed to overwrite the Base language, and the language ID is updated in `intl.inf`, `hivesys.inf`, `hivedef.inf`.
 
 Choose a processing mode (prompt `Mode [S/F]`):
-- **Safe (S)**: Boot-critical files are left untouched — `ntoskrnl.exe`, `ntkr*.dll`, and `hal*.dll` pass through unchanged (no resource replacement, no checksum re-stamp), and `driver.cab` / `SP*.CAB` are not processed. The original archives are kept on the output media.
+- **Safe (S)**: Boot-critical files are left untouched. The list is read from the Base ISO's `txtsetup.sif`, mirroring `type TXTSETUP.SIF | findstr /r ",_[1-9] ,[1-9]_"` (every file text-mode setup loads from disk), plus `ntoskrnl.exe`, `usetup.exe` and `smss.exe`. Those files are deleted from both staging trees (`_work\ISO_1` and `_work\ISO_2`) before extraction, so no resource replacement (and no checksum re-stamp) happens for them; Step 9 then copies the original Base files into the output. The post-step `usetup.exe` → `system32\smss.exe` copy is also skipped. As a result, `smss.exe` stays unchanged and **text-mode setup remains in the Base language (untranslated)**. `driver.cab` / `SP*.CAB` are not processed and the original archives are kept on the output media. All other binaries are patched normally.
 - **Full (F)**: Everything is processed like usual — every PE binary gets its resources replaced, PE checksums are re-stamped, and `Driver.cab` / `SP*.CAB` are rebuilt.
 
 > **ALPHA Base media:** the `Mode [S/F]` prompt is skipped. The run always uses
@@ -216,6 +218,7 @@ Output/
   I386/             Architecture-specific binaries
     setup*.exe      Decompressed setup files
     txtsetup.sif    Setup configuration
+    WINNT.SIF       Generated setup answer file (driver signing ignored)
     system32/       System files (ntdll.dll, smss.exe, etc.)
     driver.cab      Reconstructed driver cabinet
   system32/         Root-level system files
@@ -258,6 +261,7 @@ This tree is ready for import into **nLite** or other ISO repackaging tools.
   - `driver_bins`: Extracted from Driver.cab (skipped in Safe mode)
   - `servicepack_bins`: Extracted from SP*.CAB (if present; skipped in Safe mode)
   - `wow_bins`: WOW64 binaries (on 64-bit media only)
+- In Safe mode, the boot-critical files listed in the Base `txtsetup.sif` (plus `ntoskrnl.exe`, `usetup.exe` and `smss.exe`) are deleted from `_work\ISO_1` and `_work\ISO_2` before extraction, so they are never patched. Since `smss.exe` is not updated, text-mode setup stays untranslated (Base language)
 
 **Step 5: Resource Extraction**
 - Scans donor ISO binaries for embedded resources
@@ -268,7 +272,7 @@ This tree is ready for import into **nLite** or other ISO repackaging tools.
 - Patches each base ISO binary with donor resources
 - Merges string tables, dialogs, menus, accelerators
 - Always runs in Replace fashion: language-specific files (.bin) are renamed to overwrite the base language
-- In Safe mode, `ntoskrnl.exe`, `ntkr*.dll`, and `hal*.dll` are copied through untouched; `driver_bins` and `servicepack_bins` are not processed
+- In Safe mode, the files listed in the Base `txtsetup.sif` boot set (plus `ntoskrnl.exe`, `usetup.exe` and `smss.exe`) are copied through untouched; `driver_bins` and `servicepack_bins` are not processed
 - On ALPHA Base media, only `comp_bins` is processed; `uncomp_bins`, `driver_bins`, `servicepack_bins` and WOW bins are left as shipped on the Base ISO
 - Each file is named in the log *before* it is processed (`Processing: ...`), so if the run ever dies mid-file, the last line identifies the file rather than its predecessor
 - With `-v`, every resource blob is logged twice - `-> <blob> (<n> bytes)` just before it is submitted and `~ <blob> (<n> bytes)` once it applied - on the screen **and** in the logfile. The last `->` line without a matching `~` is the blob that hit trouble
@@ -277,6 +281,7 @@ This tree is ready for import into **nLite** or other ISO repackaging tools.
 - Those files stay in the Base language. The run summary lists how many were affected; the `RESOURCE UPDATE FAILED`/`CRASHED` lines name them. Matching the Base and donor builds (same service pack and component set) avoids the problem entirely
 
 **Step 7: Hex Patching (OS-specific)**
+- **Optional but strongly recommended.** Hex patching is not required for a run to complete. Driver-signing enforcement is handled separately by the generated `WINNT.SIF` (see Post-Step 10); the patches here still apply the setup-side changes and are recommended for correct cross-language setup behaviour.
 - Applies hand-coded binary patches to `setupapi.dll`, `syssetup.dll`, `sfc_os.dll`
 - Patterns vary by OS version (Win2000, WinXP, Win2003, Win2003x64) **and** by the Base media's service-pack level (XP uses one set below SP2 and another at SP2+; Server 2003 uses one set for RTM and another for SP+)
 - Every pattern is verified after matching. A pattern that finds no match is logged as a warning rather than silently skipped, so a wrong variant selection surfaces immediately:
@@ -285,6 +290,7 @@ This tree is ready for import into **nLite** or other ISO repackaging tools.
               The binary does not have the expected layout - check the detected
               Base OS / service-pack level.
   ```
+- The former x86 `syssetup.dll` fallback (`C6 45 08 01` → `C6 45 08 00`) has been retired. Driver-signing enforcement is now disabled by the generated `WINNT.SIF` described under Post-Step 10.
 - IA64, DEC Alpha (ALPHA), and Alpha AXP 64-bit (AXP64): Requires manual pre-patched binaries (EPIC/RISC instruction sets are not amenable to automated patching)
 - ALPHA / AXP64 media is treated strictly as Windows 2000 (no XP/Server 2003 exists for it), including the Win2000 KERNEL32/DSSBASE/RSABASE handling — the hex-patching step alone stays manual like IA64
 - ALPHA / AXP64 support is **work in progress** and may not work fully; treat these architectures as experimental.
@@ -293,7 +299,7 @@ This tree is ready for import into **nLite** or other ISO repackaging tools.
 - Walks entire output tree recursively
 - Recalculates and updates PE header checksums
 - Ensures binaries pass Windows setup signature checks
-- In Safe mode, the excluded kernel/HAL files are not re-stamped
+- In Safe mode, the excluded boot-critical files are not re-stamped
 
 **Step 9: Re-compression**
 - Compressed files (`.comp_bins`) re-packed into output architecture directory
@@ -316,6 +322,7 @@ This tree is ready for import into **nLite** or other ISO repackaging tools.
 **Post-Step 10: Fixups**
 - When Base/Resource came from mounted CD/DVD media, clears the read-only attribute on the whole output tree (needed so INF edits can succeed). In post-build-only mode this clearing is unconditional, because the output folder is user-supplied and may have come off optical media regardless of what the inputs look like
 - Copies unpatched critical system files (KERNEL32.DLL, PIDGEN.DLL, rsaenh.DLL, dssenh.DLL)
+- Copies `I386\USETUP.EXE` over `I386\SYSTEM32\SMSS.EXE` (skipped in Safe mode, where both files keep the Base copies and text-mode setup therefore remains untranslated)
 - Updates locale settings in INF files (intl.inf, hivesys.inf, hivedef.inf)
 - Merges complex-script language files (Chinese, Japanese, Korean)
 - For CJK targets: merges the **donor** `txtsetup.sif` data into the output —
@@ -325,6 +332,11 @@ This tree is ready for import into **nLite** or other ISO repackaging tools.
   - The `[WinntDirectories]`/`[SourceDisksFiles]` placeholders inside the `txtsetup_1028/1041/1042/2052.txt` fixup files are ignored (they are only templates)
 - **(XIV)** When the Base media is **RTM** and the donor ships an **integrated service pack**, two extra corrections run — see [RTM Base + SP-Integrated Donor](#rtm-base--sp-integrated-cjk-donor)
 - **(XV)** Universal `[nls]` file-entry fixup: reads `OemHalFont` and the first `.nls` table from `OemCodepage` in the output `[nls]` section and adds the canonical `[SourceDisksFiles]` lines when an entry is missing (e.g. `c_857.nls = 1,,,,,,2_,2,0,0`, `vga857.fon = 1,,,,,,3_,22,0,,,1,2`). Runs for every language and architecture, and never modifies an existing entry
+- **(XVI)** Generates `<output>\<arch>\WINNT.SIF` (e.g. `I386\WINNT.SIF`, overwriting any copy from the Base media) with:
+  - `[Data]` `Autopartition=0`, `MsDosInitiated=0`, `UnattendedInstall="No"`
+  - `[Unattended]` `UnattendMode=ProvideDefault`, `UnattendSwitch="No"`, `OemPreinstall="Yes"`, `FileSystem=*`, `WaitForReboot="No"`, `NoWaitAfterTextMode=0`, `NoWaitAfterGUIMode=1`, `DriverSigningPolicy=Ignore`, `NonDriverSigningPolicy=Ignore`
+  - `[SetupParams]` `SkipMissingFiles="Yes"`
+  - The `DriverSigningPolicy` / `NonDriverSigningPolicy` entries suppress the constant driver-signing warnings during GUI-mode setup. Applied to every architecture, including in post-build-only mode
 - Copies Help/HTML documentation from donor ISO
 - Updates txtsetup.sif with new language metadata
 
@@ -407,6 +419,10 @@ Korean translations have been verified to work end-to-end with this merge. Ensur
 
 **A:** Theoretically yes, if not using the .WIM format. However, this is untested and Longhorn's resource layout differs significantly. Expect issues.
 
+### Q: Is hex patching mandatory?
+
+**A:** No, but it is strongly recommended. Every output gets a generated `WINNT.SIF` (`<arch>\WINNT.SIF`) with `DriverSigningPolicy=Ignore` and `NonDriverSigningPolicy=Ignore`, which suppresses driver-signing warnings during GUI-mode setup even when a hex pattern does not match. The Step 7 patches still apply the remaining setup-side changes and are recommended for correct cross-language setup behaviour.
+
 ### Q: Can I translate Windows 2000 ISOs?
 
 **A:** Yes, but support is limited. Windows 2000 media layout and setup sequences differ from XP/2003. KERNEL32.DLL and RSABASE.DLL handling require special care (they ship unpatched).
@@ -464,7 +480,7 @@ This mix works because x64 Edition shares core binaries with Server 2003 but WOW
 This almost always means the wrong binary variant was selected, not that the patch failed to apply.
 
 - Look at Step 1 first: `Service pack on Base media:` gives the level used for pattern selection. If it reports `SP3` but you supplied RTM media, the media really does contain `SP1.CAB`–`SP4.CAB` — check the ISO you mounted.
-- If the level is right but patterns still miss, the binary is an unexpected build. Compare the first bytes of `setupapi.dll`/`syssetup.dll` against the `from` column of the patch table in `Pipeline.cpp` and report the mismatch.
+- If the level is right but patterns still miss, the binary is an unexpected build. Compare the first bytes of `setupapi.dll`/`syssetup.dll` against the `from` column of the patch table in `Pipeline.cpp` and report the mismatch. A missed pattern is reported as a warning; the run continues, and driver-signing enforcement is still disabled by the generated `WINNT.SIF`.
 - `Detected Base OS: Windows XP (SP0 / RTM)` now makes an RTM Base explicit — previously this read as `(SP0)`.
 
 ### Output Folder Rejected at Step 2
@@ -479,7 +495,7 @@ Use `-p` / `--postbuild-only` to re-apply the finishing stages to the existing o
 ### Language Not Applied
 - Verify language detection worked (check logfile for detected LANGID)
 - Resources are always applied in Replace fashion (Attach mode was retired)
-- If you chose **Safe mode**, boot-critical files (`ntoskrnl.exe`, `ntkr*.dll`, `hal*.dll`) are intentionally left unpatched — re-run with **Full mode** to process them
+- If you chose **Safe mode**, the boot-critical files (the Base `txtsetup.sif` list plus `ntoskrnl.exe`, `usetup.exe` and `smss.exe`) are intentionally left unpatched — re-run with **Full mode** to process them. Because `smss.exe` is unchanged, text-mode setup is kept untranslated (Base language) in Safe mode
 - Verify both ISOs had the same OS version (WinXP + WinXP, not WinXP + Win2003)
 - Ensure donor ISO was a complete, valid installation media (not a partial update)
 
@@ -517,6 +533,8 @@ Bug reports and pull requests are welcome. Please include:
 | **A run failed — do I have to start over?** | Not always. `-p` / `--postbuild-only` re-applies the finishing stages (Base text files + Post-Step 10 fixups) to your existing output folder, skipping the slow Steps 3–10. It works for failures at Step 8 or later; failures in Steps 3–7 need a full run. |
 | **How long does patching take?** | Typically 15–20 minutes on a modern SSD, longer on HDDs. `-p` is near-instant by comparison. |
 | **Can I patch multiple languages at once?** | No; run the tool separately for each language pair. |
+| **Is hex patching mandatory?** | No. Every output gets a generated `WINNT.SIF` with driver signing set to `Ignore`; the Step 7 hex patches are recommended but not required for the run to complete. |
+| **Why is text-mode setup still in the Base language?** | Safe mode leaves `smss.exe` unchanged, so text-mode setup is kept untranslated. Use Full mode if text-mode setup must be translated. |
 | **Do CJK targets (Chinese/Japanese/Korean) need anything extra?** | Yes — use the matching CJK language as the Resource/donor ISO. The tool merges the donor's `txtsetup.sif` sections (`[WinntDirectories]`, `[SourceDisksFiles]`) and copies missing donor files in Post-Step 10. |
 | **Will this work on Windows 7+ ISOs?** | No. This tool targets Windows 2000, XP, and Server 2003 (NT 5.x) only. |
 | **Do I need nLite?** | Yes, to repackage the output into a bootable ISO. |
