@@ -3,6 +3,7 @@
 
 #include <cwchar>
 #include <cstdarg>
+#include <cstdlib>
 #include <algorithm>
 #include <set>
 #include <shlwapi.h>
@@ -443,7 +444,20 @@ std::wstring Prompt(const wchar_t* msg) {
     fwprintf(stdout, L"%s", msg);
     fflush(stdout);
     wchar_t buf[1024] = {0};
-    if (!fgetws(buf, _countof(buf), stdin)) return L"";
+    if (!fgetws(buf, _countof(buf), stdin)) {
+        // stdin is closed or at EOF (redirected/piped input ran out). No answer
+        // can arrive any more, so abort instead of letting the caller's retry
+        // loop spin forever and grow the log without bound.
+        if (feof(stdin)) {
+            fwprintf(stderr, L"\n[FATAL] End of input while waiting for an answer. "
+                             L"Aborting.\n");
+            LogError(L"[FATAL] End of input while waiting for an answer. Aborting.");
+            fflush(stderr);
+            fflush(stdout);
+            exit(2);
+        }
+        return L"";
+    }
     std::wstring s = buf;
     // trim CR/LF and quotes/spaces
     while (!s.empty() && (s.back() == L'\r' || s.back() == L'\n' ||
