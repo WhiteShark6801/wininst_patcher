@@ -14,3 +14,10 @@ const wchar_t* LangIdName(DWORD langId);
 // Rename every .bin in `folder` whose filename ends with "_lang<from>.bin"
 // to "_lang<to>.bin" (case-insensitive).  Returns the count of files renamed.
 int RenameBinLangSuffix(const std::wstring& folder, DWORD from, DWORD to);
+
+// Copy every .bin in `srcFolder` whose filename ends with "_lang<from>.bin"
+// into `dstFolder` renamed to "_lang<to>.bin" (case-insensitive). Used to
+// build the duplicate resource set for the second replacement pass.
+// Returns the count of files copied.
+int CopyBinLangSuffix(const std::wstring& srcFolder, const std::wstring& dstFolder,
+                      DWORD from, DWORD to);
