@@ -1,3 +1,4 @@
+
 name: Build C++ Project
 
 on:
@@ -14,6 +15,15 @@ jobs:
       - name: Checkout repository
         uses: actions/checkout@v4
 
-      - name: Build project
+      - name: Configure MSVC
+        uses: ilammy/msvc-dev-cmd@v1
+        with:
+          arch: x64
+
+      - name: Verify compiler
         shell: cmd
-        run: cl /nologo /W3 /O2 /EHa /std:c++17 /permissive- /utf-8 /D_UNICODE /DUNICODE /D_CRT_SECURE_NO_WARNINGS /D_WIN32_WINNT=0x0501 /MT /I..\include ..\src\main.cpp ..\src\Common.cpp ..\src\ResourceExtract.cpp ..\src\ResourceUpdate.cpp ..\src\CabUtil.cpp ..\src\Language.cpp ..\src\HexPatch.cpp ..\src\Pipeline.cpp /Fe:wininst_patcher.exe /link /nologo /SUBSYSTEM:CONSOLE shlwapi.lib imagehlp.lib user32.lib advapi32.lib
+        run: cl
+
+      - name: Build
+        shell: cmd
+        run: build.cmd
