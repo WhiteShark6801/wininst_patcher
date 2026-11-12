@@ -30,6 +30,16 @@ static bool PostStep10Fixups(const std::wstring& outRoot, const std::wstring& is
                              const std::wstring& iso2Root, Arch arch, Arch donorArch,
                              DWORD baseLang, DWORD newLang, bool replaceMode);
 
+// Safe-mode helpers live further down, next to the INF/text utilities they use.
+namespace {
+enum class InfEnc;
+bool LoadInfText(const std::wstring& path, std::wstring& text, InfEnc* outEnc);
+std::wstring TrimWS(const std::wstring& s);
+std::wstring CjkLangTag(DWORD langId);   // defined with the language fixups below
+void LoadSafeModeExcludeList(const std::wstring& iso1Root, const wchar_t* archDir);
+}
+static void RemoveSafeModeExcludedFromStaging(const Paths& p);
+
 
 // ---------------------------------------------------------------------------
 // Step 1 helpers : architecture + service pack detection
@@ -746,6 +756,57 @@ static bool TranslateManualPrepatchedBinaries(const Paths& p,
 
     LogInfo(L"  [%s] Replacing resources for setupapi.dll / syssetup.dll...", archTag.c_str());
     bool okReplace = ReplaceResources(stageDir, p.resources, p.procComp, false, nullptr);
+
+    // CJK Base + Western donor: these two binaries get their resources replaced
+    // a second time with the donor set mapped to lang1033. Setupapi/syssetup
+    // carry both a 1033 (US English) and the CJK resource; the first pass above
+    // only fills the CJK slot, so without this the untouched English resource
+    // would remain and become the default. Scoped to just these two files by
+    // staging their current copy from p.procComp.
+    DWORD manualBaseLang = 0, manualDonorLang = 0;
+    bool gotManualBase  = DetectMediaLangId(p.iso1, manualBaseLang);
+    bool gotManualDonor = DetectMediaLangId(p.iso2, manualDonorLang);
+    bool needsSecondPass =
+        gotManualBase && gotManualDonor && manualBaseLang != manualDonorLang &&
+        !CjkLangTag(manualBaseLang).empty() &&
+        CjkLangTag(manualDonorLang).empty() &&
+        manualDonorLang != 1033;
+
+    if (okReplace && needsSecondPass) {
+        LogInfo(L"  [%s] CJK Base + Western donor: second pass for setupapi.dll / "
+                L"syssetup.dll (lang1033).", archTag.c_str());
+
+        std::wstring stage2 = PathJoin(p.procRoot, archTag + L"_stage_1033");
+        MakeDirs(stage2);
+        bool okStage2 = true;
+        for (const wchar_t* lower : { L"setupapi.dll", L"syssetup.dll" }) {
+            std::wstring src = PathJoin(p.procComp, lower);
+            if (!FileExists(src)) {
+                std::wstring upper = lower;
+                for (auto& ch : upper) ch = (wchar_t)towupper(ch);
+                src = PathJoin(p.procComp, upper);
+            }
+            if (!FileExists(src)) continue;
+            if (!CopyFileForce(src, PathJoin(stage2, GetFileNameFromPath(src))))
+                okStage2 = false;
+        }
+
+        std::wstring res1033 = PathJoin(p.root, L"Resources_1033_manual");
+        RemoveTree(res1033);
+        int dup = CopyBinLangSuffix(p.resources, res1033, manualBaseLang, 1033);
+        LogInfo(L"  [%s] duplicated %d resource file(s) as lang%lu (from lang%lu).",
+                archTag.c_str(), dup, (unsigned long)1033, (unsigned long)manualBaseLang);
+
+        if (okStage2 && dup > 0) {
+            okReplace = ReplaceResources(stage2, res1033, p.procComp, false, nullptr);
+        } else {
+            LogWarn(L"  [%s] second resource pass skipped - staging or duplication failed.",
+                    archTag.c_str());
+        }
+        RemoveTree(stage2);
+        RemoveTree(res1033);
+    }
+
     if (!okReplace) {
         LogWarn(L"  [%s] Resource replacement failed for one or more of the "
                 L"%s binaries; check %s.",
@@ -1012,86 +1073,93 @@ static bool IsPureInteger(const std::wstring& s) {
     return true;
 }
 
-// Safe mode: files whose base name matches one of the boot-critical kernel /
-// HAL families, the driver/service-pack archives, or driver binaries
-// (*.sys expanded form + *.sy_ compressed loose form) are copied through
-// untouched (their resources are never replaced, nor checksums re-stamped).
-// Covers both uncompressed and expanded-compressed name forms.
-static bool IsSafeModeExcludedFile(const std::wstring& fileName) {
-    std::wstring lower = ToLower(fileName);
-    if (StartsWithI(lower, L"ntoskrnl")) return true;   // ntoskrnl.exe
-    if (StartsWithI(lower, L"ntkr"))     return true;   // ntkrnlmp.exe and other ntkr*.exe
-    if (StartsWithI(lower, L"hal"))      return true;   // hal.dll and hal*.dll variants
+// ---------------------------------------------------------------------------
+// Safe mode: boot-critical exclusion set
+//
+// The list of files the text-mode setup needs comes straight from the Base
+// ISO's txtsetup.sif, mirroring
+//     type TXTSETUP.SIF | findstr /r ",_[1-9] ,[1-9]_"
+// findstr treats the space-separated fragments as OR'ed patterns, so a line
+// matches when it contains ",_<1-9>" or ",<1-9>_" (the storage/disk layout
+// tokens). Every matching line's key (the text before '=') names a
+// boot-critical file. ntoskrnl.exe is not listed on the media and is always
+// added. Driver.cab and SP*.CAB are archives, not PE files, and are never
+// resource-patched in Safe mode either.
+//
+// Approach: the matching files are deleted from the staging trees
+// (_work\ISO_1 and _work\ISO_2) before resource extraction/replacement, so
+// they are never edited and Step 9 copies the Base originals to the output.
+// ---------------------------------------------------------------------------
+static std::set<std::wstring> g_safeModeExclude;
 
-    if (lower == L"driver.cab")          return true;   // Driver.cab archive
-
-    // Service-pack archives: SP1.CAB, SP2.CAB, ... (no static list; any
-    // "SP"+digits+".CAB" counts).
-    if (lower.size() > 6 &&
-        StartsWithI(lower, L"sp") &&
-        EndsWithI(lower, L".cab")) {
-        bool digitsOnly = true;
-        for (size_t i = 2; i + 4 < lower.size(); ++i) {
-            if (!std::iswdigit(lower[i])) { digitsOnly = false; break; }
-        }
-        if (digitsOnly) return true;
+// True when `line` contains a fragment matched by the findstr pattern.
+static bool MatchesSafeModeBootPattern(const std::wstring& line) {
+    for (size_t i = 0; i + 2 < line.size(); ++i) {
+        if (line[i] != L',') continue;
+        if (line[i + 1] == L'_' && line[i + 2] >= L'1' && line[i + 2] <= L'9')
+            return true;   // ",_<1-9>"
+        if (line[i + 1] >= L'1' && line[i + 1] <= L'9' && line[i + 2] == L'_')
+            return true;   // ",<1-9>_"
     }
-
-    // Driver binaries shipped loose on the media, in both forms:
-    //   *.sys - expanded in staging (comp_bins/uncomp_bins) + uncompressed
-    //           on media; this is what ReplaceResources/FixCheckSumsInTree see.
-    //   *.sy_ - compressed loose form on the original ISO; this is what the
-    //           post-run restore pass sees.
-    // Drivers stored inside Driver.cab / SP*.CAB are already covered by the
-    // cab exclusions above (and their contents are never unpacked to loose
-    // names in the safe-mode flow).
-    if (EndsWithI(lower, L".sy_"))       return true;
-    if (EndsWithI(lower, L".sys"))       return true;
     return false;
 }
 
-// Safe mode: after the whole pipeline finishes, re-copy every excluded file
-// from the Base ISO onto the output media, mirroring its relative path and
-// overwriting whatever the pipeline wrote (e.g. a re-compressed .ex_/.sy_).
-// This guarantees the boot-critical kernel/HAL family, Driver.cab / SP*.CAB
-// and loose drivers (*.sys / *.sy_) on the output are byte-identical
-// to the Base ISO originals.
-static void SafeModeRestoreExcludedFiles(const std::wstring& iso1Root,
-                                         const std::wstring& outRoot,
-                                         int& count) {
-    if (!DirExists(iso1Root)) return;
+// Safe mode: excluded names never receive resource replacement and their PE
+// checksums are not re-stamped. The staging trees already have these files
+// removed; this callback is a belt-and-braces guard.
+static bool IsSafeModeExcludedFile(const std::wstring& fileName) {
+    if (g_safeModeExclude.empty()) return false;
+    std::wstring name = ToLower(GetFileNameFromPath(fileName));
+
+    if (g_safeModeExclude.count(name)) return true;
+
+    // Archives: Driver.cab and SP1.CAB, SP2.CAB, ...
+    if (name == L"driver.cab") return true;
+    if (name.size() > 6 && StartsWithI(name, L"sp") && EndsWithI(name, L".cab")) {
+        bool digitsOnly = true;
+        for (size_t i = 2; i + 4 < name.size(); ++i) {
+            if (!std::iswdigit(name[i])) { digitsOnly = false; break; }
+        }
+        if (digitsOnly) return true;
+    }
+    return false;
+}
+
+// Safe mode, approach 1: delete every file in the exclusion set from the
+// staging trees (_work\ISO_1 and _work\ISO_2) before resource extraction and
+// replacement. The donor then has no resources to contribute for those names,
+// and Step 9 copies the original Base files into the output unchanged.
+static void RemoveSafeModeExcludedFromTree(const std::wstring& dir, int& removed) {
+    if (g_safeModeExclude.empty() || !DirExists(dir)) return;
 
     WIN32_FIND_DATAW fd = {};
-    std::wstring pattern = PathJoin(iso1Root, L"*");
-    HANDLE h = FindFirstFileW(pattern.c_str(), &fd);
+    HANDLE h = FindFirstFileW(PathJoin(dir, L"*").c_str(), &fd);
     if (h == INVALID_HANDLE_VALUE) return;
 
     do {
         if (wcscmp(fd.cFileName, L".") == 0 || wcscmp(fd.cFileName, L"..") == 0) continue;
-        std::wstring srcPath = PathJoin(iso1Root, fd.cFileName);
+        std::wstring full = PathJoin(dir, fd.cFileName);
 
         if (fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) {
-            // Recurse into subdirectories, mirroring the same relative path.
-            SafeModeRestoreExcludedFiles(srcPath, PathJoin(outRoot, fd.cFileName), count);
-        } else if (IsSafeModeExcludedFile(fd.cFileName)) {
-            std::wstring dstPath = PathJoin(outRoot, fd.cFileName);
-            // CopyFileForce ensures the target directories exist first.
-            if (CopyFileForce(srcPath, dstPath)) {
-                count++;
-                LogInfo(L"  [+] Safe-mode restore: %s -> %s", fd.cFileName, dstPath.c_str());
+            RemoveSafeModeExcludedFromTree(full, removed);
+        } else if (g_safeModeExclude.count(ToLower(fd.cFileName))) {
+            if (DeleteFileW(full.c_str())) {
+                removed++;
+                LogDebug(L"  Safe mode: removed %s", full.c_str());
+            } else {
+                LogWarn(L"  Safe mode: could not remove %s (%lu)",
+                        full.c_str(), GetLastError());
             }
         }
     } while (FindNextFileW(h, &fd));
     FindClose(h);
 }
 
-static void SafeModeRestoreExcludedFiles(const std::wstring& iso1Root,
-                                         const std::wstring& outRoot) {
-    int count = 0;
-    SafeModeRestoreExcludedFiles(iso1Root, outRoot, count);
-    if (count > 0) {
-        LogInfo(L"  Safe-mode restore: %d excluded file(s) copied from Base ISO.", count);
-    }
+static void RemoveSafeModeExcludedFromStaging(const Paths& p) {
+    int removed = 0;
+    RemoveSafeModeExcludedFromTree(p.iso1Bins, removed);
+    RemoveSafeModeExcludedFromTree(p.iso2Bins, removed);
+    LogInfo(L"  Safe mode: removed %d boot-critical file(s) from the staging trees.", removed);
 }
 
 // ---------------------------------------------------------------------------
@@ -1467,10 +1535,11 @@ bool RunPipeline(bool postBuildOnly) {
         wprintf(L"\n");
     } else {
         wprintf(L"Choose how the Base ISO should be processed:\n");
-        wprintf(L"  S  Safe  - boot-critical files are left untouched: ntoskrnl.exe,\n");
-        wprintf(L"             ntkr*.exe and hal*.dll pass through unchanged, driver.cab\n");
-        wprintf(L"             / SP*.CAB are not processed (the originals are kept),\n");
-        wprintf(L"             and loose *.sys / *.sy_ driver files are left as-is.\n");
+        wprintf(L"  S  Safe  - boot-critical files are left untouched. The list comes\n");
+        wprintf(L"             from the Base ISO's txtsetup.sif (the files text-mode\n");
+        wprintf(L"             setup loads) plus ntoskrnl.exe: their resources are not\n");
+        wprintf(L"             replaced and their checksums are not re-stamped.\n");
+        wprintf(L"             Driver.cab / SP*.CAB are not processed (originals kept).\n");
         wprintf(L"  F  Full  - process everything like usual (every PE binary gets its\n");
         wprintf(L"             resources replaced and Driver.cab / SP*.CAB rebuilt).\n");
         wprintf(L"\n");
@@ -1503,8 +1572,9 @@ bool RunPipeline(bool postBuildOnly) {
     if (alphaCompOnly) {
         LogInfo(L"Processing mode: ALPHA COMP_BINS-ONLY (automatic; Safe/Full prompt skipped)");
     } else {
-        LogInfo(L"Processing mode: %s", safeMode ? L"SAFE (skip ntoskrnl/ntkr*/hal* + driver.cab + SP*.CAB + *.sys/*.sy_)"
-                                                : L"FULL (process everything)");
+        LogInfo(L"Processing mode: %s", safeMode
+                ? L"SAFE (txtsetup.sif boot list + ntoskrnl.exe; Driver.cab/SP*.CAB kept)"
+                : L"FULL (process everything)");
     }
     LogInfo(L"Resource application: %s",
             doRename ? L"REPLACE (rename .bin lang suffix to Base)"
@@ -1524,8 +1594,8 @@ bool RunPipeline(bool postBuildOnly) {
             LogInfo(L"Safe mode: SP*.CAB processing disabled - original archive kept.");
             doSp = false;
         }
-        LogInfo(L"Safe mode: kernel/HAL binaries (ntoskrnl, ntkr*, hal*) left untouched.");
-        LogInfo(L"Safe mode: loose driver binaries (*.sys / *.sy_) left untouched.");
+        LoadSafeModeExcludeList(p.iso1, ArchDirName(arch1));
+        LogInfo(L"Safe mode: those files keep the Base resources; all other binaries are patched.");
     }
 
     // ---------------- Step 3 ----------------
@@ -1581,6 +1651,15 @@ bool RunPipeline(bool postBuildOnly) {
         LogInfo(L"  renamed %d files in wow_bins.", n);
     }
 
+    // Safe mode, approach 1: delete the boot-critical files from the staging
+    // trees (_work\ISO_1 and _work\ISO_2) before extraction/replacement. They
+    // are therefore never extracted, patched or checksummed; Step 9 copies the
+    // original Base versions into the output.
+    if (safeMode) {
+        wprintf(L"\n=== Safe mode: removing boot-critical files from staging ===\n");
+        RemoveSafeModeExcludedFromStaging(p);
+    }
+
 // ---------------- Step 5 ----------------
     wprintf(L"\n=== Step 5: Extract resources from Resource ISO ===\n");
     // comp_bins / wow_bins were already expanded to real PE extensions in
@@ -1621,6 +1700,47 @@ bool RunPipeline(bool postBuildOnly) {
     if (doDriver) ClearReadOnlyInDir(p.procDriver);
     if (doSp)     ClearReadOnlyInDir(p.procServicepack);
     if (doWow)    ClearReadOnlyInDir(p.procWow);
+
+    // ---------------------------------------------------------------------
+    // Second resource pass: CJK Base + Western Donor.
+    //
+    // A CJK Base binary usually carries two resources per item: one at 1033
+    // (US English) and one at the CJK language. Step 6 replaces the CJK slot
+    // with the donor content, but the untouched 1033 resource then remains and
+    // becomes the default, so the UI falls back to English. Duplicate the
+    // already-renamed donor resource set as lang1033 and apply it in place, so
+    // both the CJK and the 1033 slots carry the donor language.
+    //
+    // This is the "rename to 1033 + second pass" approach: slower than simply
+    // deleting the 1033 resources, but it never leaves a binary without a
+    // usable resource set.
+    // ---------------------------------------------------------------------
+    bool cjkBaseWesternDonor =
+        gotLang1 && gotLang2 && doRename &&
+        !CjkLangTag(lang1).empty() &&
+        CjkLangTag(lang2).empty() &&
+        lang2 != 1033;
+
+    if (cjkBaseWesternDonor) {
+        wprintf(L"\n=== Step 6b: Second resource pass (CJK Base + Western donor) ===\n");
+        std::wstring res1033 = PathJoin(p.root, L"Resources_1033");
+        RemoveTree(res1033);
+        int n = CopyBinLangSuffix(p.resources, res1033, lang1, 1033);
+        LogInfo(L"  duplicated %d resource file(s) as lang%lu (from lang%lu).",
+                n, (unsigned long)1033, (unsigned long)lang1);
+
+        if (n > 0) {
+            ReplaceResources(p.procComp, res1033, p.procComp, false, exclude);
+            if (!alphaCompOnly) {
+                ReplaceResources(p.procUncomp, res1033, p.procUncomp, false, exclude);
+                if (doDriver) ReplaceResources(p.procDriver, res1033, p.procDriver, false, nullptr);
+                if (doSp)     ReplaceResources(p.procServicepack, res1033, p.procServicepack, false, nullptr);
+                if (doWow)    ReplaceResources(p.procWow, res1033, p.procWow, false, exclude);
+            }
+        }
+        RemoveTree(res1033);
+    }
+
 	// Call the updated orchestrator using p.procComp paths
     ApplyHexEditsToUncompressed(p, baseSpNum);
     // ---------------- Step 7 ----------------
@@ -1763,10 +1883,6 @@ PostStep10Fixups(p.output, p.iso1, p.iso2, arch1, arch2,
  	ApplyHelpHtmlOverwrites(p.output, p.iso2);
     if (alphaCompOnly) {
         if (!ExpandAlphaVgaFonts(p.output)) buildOk = false;
-    }
-    if (safeMode) {
-        wprintf(L"\n=== Safe mode: restore excluded files from Base ISO ===\n");
-        SafeModeRestoreExcludedFiles(p.iso1, p.output);
     }
     if (!buildOk) {
         LogError(L"FAILED: one or more output steps failed. Output at %s is INCOMPLETE.",
@@ -1986,6 +2102,71 @@ std::wstring FindOutputFile(const std::wstring& root, const wchar_t* archDir,
     p = PathJoin(root, name);
     if (FileExists(p)) return p;
     return L"";
+}
+
+// Build the Safe-mode exclusion set from the Base ISO's txtsetup.sif. Done
+// once per run, after the architecture has been detected; the same set then
+// drives resource pruning, resource replacement and checksum skipping.
+void LoadSafeModeExcludeList(const std::wstring& iso1Root, const wchar_t* archDir) {
+    g_safeModeExclude.clear();
+    g_safeModeExclude.insert(L"ntoskrnl.exe");
+    g_safeModeExclude.insert(L"driver.cab");
+
+    // Locate the Base txtsetup.sif (per-arch dir, then I386, then root).
+    std::wstring sif;
+    const wchar_t* subdirs[] = { archDir, L"I386", L"" };
+    const wchar_t* names[]   = { L"txtsetup.sif", L"TXTSETUP.SIF" };
+    for (const wchar_t* sub : subdirs) {
+        for (const wchar_t* name : names) {
+            std::wstring candidate = (sub && *sub)
+                    ? PathJoin(PathJoin(iso1Root, sub), name)
+                    : PathJoin(iso1Root, name);
+            if (FileExists(candidate)) { sif = candidate; break; }
+        }
+        if (!sif.empty()) break;
+    }
+
+    if (sif.empty()) {
+        LogWarn(L"Safe mode: txtsetup.sif not found under %s - only ntoskrnl.exe, "
+                L"Driver.cab and SP*.CAB are excluded.",
+                iso1Root.c_str());
+        return;
+    }
+
+    std::wstring text;
+    if (!LoadInfText(sif, text, nullptr)) {
+        LogWarn(L"Safe mode: could not read %s - only ntoskrnl.exe, "
+                L"Driver.cab and SP*.CAB are excluded.", sif.c_str());
+        return;
+    }
+
+    int matched = 0;
+    size_t pos = 0;
+    while (pos <= text.size()) {
+        size_t nl = text.find_first_of(L"\r\n", pos);
+        std::wstring line = text.substr(
+            pos, (nl == std::wstring::npos) ? std::wstring::npos : nl - pos);
+
+        if (MatchesSafeModeBootPattern(line)) {
+            size_t eq = line.find(L'=');
+            if (eq != std::wstring::npos) {
+                std::wstring key = ToLower(TrimWS(line.substr(0, eq)));
+                // Filename keys never contain whitespace; anything else on a
+                // matching line belongs to a different section.
+                if (!key.empty() &&
+                    key.find_first_of(L" \t") == std::wstring::npos) {
+                    if (g_safeModeExclude.insert(key).second) matched++;
+                }
+            }
+        }
+
+        if (nl == std::wstring::npos) break;
+        pos = nl + 1;
+    }
+
+    LogInfo(L"Safe mode: %d boot-critical file name(s) excluded from resource replacement "
+            L"(%d from %s + ntoskrnl.exe).",
+            (int)g_safeModeExclude.size(), matched, sif.c_str());
 }
 
 // Replace the value of an INF-style line of the form
@@ -2633,13 +2814,13 @@ std::vector<std::wstring> CollectSectionLines(const std::wstring& text,
 
 // Given collected CJK donor [SourceDisksFiles] body lines, return the subset
 // that belongs to the *correct* occurrence - the one that declares the CJK NLS
-// codepage table `c_10003.nls` (the marker line `c_10003.nls = 1,,,,,,,2,0,0`).
+// codepage table `femgrate.exe` (the marker line `femgrate.exe = 1,,,,,,,2,0,0`).
 // txtsetup.sif for CJK languages has multiple [SourceDisksFiles] blocks; only
-// the one carrying c_10003.nls lists the language-specific files we must add.
+// the one carrying femgrate.exe lists the language-specific files we must add.
 std::vector<std::wstring> CollectCjkSourceDisksLines(const std::wstring& text) {
     std::vector<std::wstring> out;
     size_t pos = 0;
-    const std::wstring kMarker = L"c_10003.nls";
+    const std::wstring kMarker = L"femgrate.exe";
 
     while (pos < text.size()) {
         size_t nl = text.find_first_of(L"\r\n", pos);
@@ -2828,7 +3009,7 @@ static void EnsureOemNlsSourceDisksEntries(const std::wstring& sifPath) {
     }
 
     std::vector<std::wstring> needed;
-    if (!nlsName.empty())  needed.push_back(nlsName  + L" = 1,,,,,,2_,2,0,0");
+    if (!nlsName.empty())  needed.push_back(nlsName  + L" = 1,,,,,,2_,2,0,0,,1,2");
     if (!fontName.empty()) needed.push_back(fontName + L" = 1,,,,,,,22,0,0");
 
     if (needed.empty()) {
@@ -2980,7 +3161,7 @@ static int FixRtmCjkMediaIds(const std::wstring& outRoot, const wchar_t* archDir
 //   1) combine every [WinntDirectories] section of the donor txtsetup.sif and
 //      append the non-duplicate lines to the output txtsetup.sif,
 //   2) locate the correct [SourceDisksFiles] occurrence (the one declaring the
-//      CJK NLS table `c_10003.nls`) and append its lines to the output, and
+//      CJK NLS table `femgrate.exe`) and append its lines to the output, and
 //   3) copy files from donor\<donor_arch> into output\<base_arch> without
 //      overwriting existing files.
 // The [WinntDirectories] / [SourceDisksFiles] blocks inside the hand-authored
@@ -3020,7 +3201,7 @@ static void MergeCjkDonorSections(const std::wstring& outRoot,
     if (!wdLines.empty()) nWd = AppendSectionLinesDedup(outText, L"WinntDirectories", wdLines);
     LogInfo(L"  (XIII) [WinntDirectories]: %d new line(s) merged from donor.", nWd);
 
-    // (2) the correct [SourceDisksFiles] (the block declaring c_10003.nls).
+    // (2) the correct [SourceDisksFiles] (the block declaring femgrate.exe).
     auto sdfLines = CollectCjkSourceDisksLines(donorText);
     int nSdf = 0;
     if (!sdfLines.empty()) nSdf = AppendSectionLinesDedup(outText, L"SourceDisksFiles", sdfLines);
@@ -3053,6 +3234,57 @@ static void MergeCjkDonorSections(const std::wstring& outRoot,
     } else {
         LogWarn(L"  (XIII) donor arch folder %s not found - file copy skipped.", donorArchAbs.c_str());
     }
+}
+
+// ---------------------------------------------------------------------------
+// Generated WINNT.SIF
+// ---------------------------------------------------------------------------
+//
+// The old x86-only syssetup.dll fallback hex edit is retired. Instead every
+// output gets a WINNT.SIF in its architecture directory (I386, AMD64, ...),
+// which is where text-mode/GUI-mode setup looks for it on CD/DVD media. The
+// [Unattended] DriverSigningPolicy/NonDriverSigningPolicy entries disable
+// driver-signature enforcement, so GUI-mode setup no longer shows the constant
+// driver-signing warnings. Any WINNT.SIF shipped by the Base media is
+// overwritten.
+static bool WriteGeneratedWinntSif(const std::wstring& outRoot, const wchar_t* archDir) {
+    static const wchar_t kContent[] =
+        L"[Data]\r\n"
+        L"Autopartition=0\r\n"
+        L"MsDosInitiated=0\r\n"
+        L"UnattendedInstall=\"No\"\r\n"
+        L"\r\n"
+        L"[Unattended]\r\n"
+        L"UnattendMode=ProvideDefault\r\n"
+        L"UnattendSwitch=\"No\"\r\n"
+        L"OemPreinstall=\"Yes\"\r\n"
+        L"FileSystem=*\r\n"
+        L"WaitForReboot=\"No\"\r\n"
+        L"NoWaitAfterTextMode=0\r\n"
+        L"NoWaitAfterGUIMode=1\r\n"
+        L"DriverSigningPolicy=Ignore\r\n"
+        L"NonDriverSigningPolicy=Ignore\r\n"
+        L"\r\n"
+        L"[SetupParams]\r\n"
+        L"SkipMissingFiles=\"Yes\"\r\n";
+
+    std::wstring dir = PathJoin(outRoot, archDir);
+    if (!MakeDirs(dir)) {
+        LogWarn(L"  (XVI) cannot create %s for WINNT.SIF generation.", dir.c_str());
+        return false;
+    }
+
+    std::wstring path = PathJoin(dir, L"WINNT.SIF");
+    // A WINNT.SIF copied from read-only optical media would reject CREATE_ALWAYS.
+    SetFileAttributesW(path.c_str(), FILE_ATTRIBUTE_NORMAL);
+
+    if (!SaveInfText(path, kContent, InfEnc::Utf8)) {
+        LogWarn(L"  (XVI) could not write %s", path.c_str());
+        return false;
+    }
+
+    LogInfo(L"  (XVI) generated %s (driver-signing enforcement disabled).", path.c_str());
+    return true;
 }
 
 static bool PostStep10Fixups(const std::wstring& outRoot,
@@ -3511,6 +3743,13 @@ static bool PostStep10Fixups(const std::wstring& outRoot,
         } else {
             EnsureOemNlsSourceDisksEntries(sifPath);
         }
+    }
+
+    // (XVI) WINNT.SIF: disables driver-signature enforcement during GUI-mode
+    // setup. This replaces the retired syssetup.dll x86 fallback hex edit.
+    if (!WriteGeneratedWinntSif(outRoot, archDir)) {
+        LogWarn(L"  (XVI) WINNT.SIF generation failed - GUI-mode setup may show "
+                L"driver-signing warnings.");
     }
 
     return true;

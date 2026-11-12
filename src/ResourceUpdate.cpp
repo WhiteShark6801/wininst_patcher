@@ -171,7 +171,10 @@ void WalkAndProcess(const std::wstring& inputFolder,
 
         totalProcessed++;
         std::wstring outPath = PathJoin(outputFolder, fd.cFileName);
-        if (!CopyFileForce(full, outPath)) continue;
+        // In-place pass (input folder == output folder): the file is already
+        // at the destination, so don't copy it onto itself.
+        bool inPlace = (_wcsicmp(full.c_str(), outPath.c_str()) == 0);
+        if (!inPlace && !CopyFileForce(full, outPath)) continue;
 
         // Safe mode: excluded boot-critical files pass through unmodified.
         if (isExcluded && isExcluded(fd.cFileName)) {

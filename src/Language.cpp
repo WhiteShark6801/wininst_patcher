@@ -182,7 +182,6 @@ const wchar_t* LangIdName(DWORD langId) {
 int RenameBinLangSuffix(const std::wstring& folder, DWORD from, DWORD to) {
     if (from == to) return 0;
     if (!DirExists(folder)) return 0;
-
     wchar_t fromBuf[16], toBuf[16];
     swprintf_s(fromBuf, L"_lang%lu.bin", from);
     swprintf_s(toBuf,   L"_lang%lu.bin", to);
@@ -215,4 +214,40 @@ int RenameBinLangSuffix(const std::wstring& folder, DWORD from, DWORD to) {
     } while (FindNextFileW(h, &fd));
     FindClose(h);
     return renamed;
+}
+
+int CopyBinLangSuffix(const std::wstring& srcFolder, const std::wstring& dstFolder,
+                      DWORD from, DWORD to) {
+    if (from == to) return 0;
+    if (!DirExists(srcFolder)) return 0;
+    MakeDirs(dstFolder);
+
+    wchar_t fromBuf[32], toBuf[32];
+    swprintf_s(fromBuf, L"_lang%lu.bin", from);
+    swprintf_s(toBuf,   L"_lang%lu.bin", to);
+    std::wstring fromSuf = fromBuf;
+    std::wstring toSuf   = toBuf;
+
+    int copied = 0;
+    WIN32_FIND_DATAW fd = {};
+    std::wstring pattern = PathJoin(srcFolder, L"*.bin");
+    HANDLE h = FindFirstFileW(pattern.c_str(), &fd);
+    if (h == INVALID_HANDLE_VALUE) return 0;
+
+    do {
+        std::wstring name = fd.cFileName;
+        if (!EndsWithI(name, fromSuf)) continue;
+        std::wstring stem = name.substr(0, name.size() - fromSuf.size());
+        std::wstring srcPath = PathJoin(srcFolder, name);
+        std::wstring dstPath = PathJoin(dstFolder, stem + toSuf);
+
+        if (CopyFileForce(srcPath, dstPath)) {
+            copied++;
+        } else {
+            LogWarn(L"copy failed (%lu): %s -> %s",
+                    GetLastError(), srcPath.c_str(), dstPath.c_str());
+        }
+    } while (FindNextFileW(h, &fd));
+    FindClose(h);
+    return copied;
 }
